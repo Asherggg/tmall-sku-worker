@@ -8,12 +8,12 @@ const BASE = import.meta.env.VITE_WORKER_URL || "http://127.0.0.1:19828";
 const demoHealth: WorkerHealth = {
   ready: false,
   mode: "demo",
-  workerVersion: "0.1.2",
+  workerVersion: "0.1.3",
   browser: "unavailable",
   profile: "应用专属 Profile",
   loggedIn: false,
   contract: "demo",
-  message: "Worker 尚未启动，当前显示本地演练数据",
+  message: "Worker 尚未启动，请重新打开程序或检查后台进程",
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {

@@ -35,6 +35,8 @@ export interface TaskRecord {
   attempts: number;
   errorCode?: string;
   errorMessage?: string;
+  liveWriteStarted?: boolean;
+  writePhase?: string;
   oldSkuIds?: string[];
   newSkuIds?: string[];
   createdAt: string;
@@ -72,6 +74,7 @@ export interface WorkerHealth {
   message?: string;
   currentUrl?: string;
   webdriver?: boolean | null;
+  unresolvedLiveWrites?: number;
 }
 
 export interface AuditRecord {

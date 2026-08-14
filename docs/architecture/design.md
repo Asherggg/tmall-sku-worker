@@ -23,7 +23,7 @@ Tauri 2
 
 ### Worker
 
-- 默认 `demo`，只生成计划与模拟结果。
+- 源码直接启动默认 `demo`；v0.1.3 Windows 安装版由 Tauri host 显式启用 `tmall-publish-v1`。
 - `live` 必须同时满足环境开关、批次确认词和任务快照校验。
 - 一个 Profile 只有一个 Worker；同一账号同一时间只写一个 `itemId`。
 - 未知提交结果统一进入 `needs_manual_review`，禁止自动重试写请求。
@@ -42,7 +42,7 @@ Tauri 2
 | POST | `/tasks` | 创建批次任务 |
 | POST | `/tasks/:id/plan` | 生成演练计划 |
 | POST | `/tasks/:id/start` | 启动任务；live 需要确认词 |
-| POST | `/tasks/:id/pause` | 在安全边界暂停 |
+| POST | `/tasks/:id/pause` | 仅演练任务在安全边界暂停；线上任务返回 409 |
 | POST | `/tasks/:id/retry` | 仅重试已验证可重试阶段 |
 | GET | `/tasks/:id` | 任务详情、时间线和差异 |
 | GET | `/audit/export` | 导出脱敏审计 JSON |
@@ -74,7 +74,8 @@ interface ItemTaskInput {
 - 写入流程是：完整表单快照 -> 临时唯一规格提交 -> 回读新 SKU -> 恢复原字段提交 -> 详情回读。
 - 内部接口属于 `internal-unstable`；必须保存接口版本、状态码、业务码和回读证据。
 - UI 语义操作只作为接口失效时的人工降级路径，不作为批处理主路径。
-- MVP 未捕获到的商品不得执行 live；Worker 应返回可解释的 `adapter_contract_missing`。
+- 页面必须提供 `GlobalStore.engine`、完整 `formValues`、销售属性预检和内部 `button-submit:click` 事件；任一运行时契约缺失时不得执行 live，并返回可解释的错误码。
+- `channelOption` 必须实时读取页面并落在页面当前允许的 `1`/`2` 白名单内，禁止重放历史值。
 
 ## 6. 失败与恢复
 

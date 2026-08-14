@@ -5,10 +5,10 @@
 | 项目 | 内容 |
 |---|---|
 | 产品名称 | Tmall SKU Worker |
-| 版本 | v0.1.2 |
+| 版本 | v0.1.3 |
 | 目标平台 | Windows 10/11 |
 | 产品形态 | Tauri 2 桌面应用，Vue 3 + TypeScript 控制台，Node.js + Playwright Worker |
-| 需求状态 | v0.1.2 可安装构建已实现；线上适配器待契约验收 |
+| 需求状态 | v0.1.3 线上重建适配器已实现；待测试商品验收 |
 
 ## 2. 背景与问题
 
@@ -16,7 +16,7 @@
 
 本产品使用系统 Edge 的应用专属 Profile 完成人工登录；登录阶段不附加 Playwright。登录完成后 Worker 才通过固定 CDP 端口连接同一有头浏览器，并在页面上下文中调用已验证的商品接口。UI 只负责任务编排、确认、进度和审计，不模拟鼠标点击提交。
 
-> 当前交付包含可运行的 Tauri/Vue 控制台、Playwright Profile 生命周期、演练队列和审计闭环。由于本次抓取材料没有覆盖可泛化且可回读的线上写契约，线上执行器默认 fail-closed，不能把演练结果当作真实商品修改。
+> 当前交付包含可运行的 Tauri/Vue 控制台、Playwright Profile 生命周期、演练队列和 `tmall-publish-v1` 线上适配器。线上执行采用两次提交和两次回读，任何未知响应或字段不一致都会进入人工复核，不能把请求已发出等同于成功。
 
 ## 3. 用户与使用场景
 
@@ -59,7 +59,7 @@
 - 浏览器状态页：Profile、登录有效性、可见登录窗口、隐藏运行状态。
 - 每行一个商品 ID 的批量粘贴、兼容 CSV、格式校验和按 `itemId` 分组预览。
 - 演练模式（默认）和线上模式（显式确认、风险摘要、确认词）。
-- 单 Worker 任务队列、暂停/继续（仅在安全边界暂停）、取消待处理任务。
+- 单 Worker 任务队列；演练任务可在安全边界暂停，线上任务启动后必须连续完成恢复与回读。
 - 商品级两阶段 SKU 重建及提交后服务端回读。
 - 任务状态、阶段日志、原始快照、结果快照、错误码和脱敏请求摘要写入本地持久化存储；v0.1 使用原子替换 JSON，启用线上适配器前迁移 SQLite。
 - 失败项详情、人工复核标记、从最近安全阶段重试。
@@ -137,12 +137,13 @@ flowchart LR
 draft -> validated -> planned -> awaiting_confirmation -> queued
 queued -> reading_snapshot -> temp_submitting -> temp_verified
 temp_verified -> restoring -> final_verifying -> succeeded
-任意可写阶段 -> paused / needs_manual_review / failed
+演练阶段 -> paused / failed
+线上可写阶段 -> needs_manual_review / failed
 failed -> retry_eligible -> queued
 ```
 
 - 每个商品显示当前阶段、开始/结束时间、尝试次数和最后错误。
-- 暂停只阻止下一个写入边界；正在进行的请求完成后才暂停。
+- 暂停仅用于演练任务。线上任务启动后不接受暂停，避免商品停留在临时规格阶段。
 - 同一批次最多一个活跃写入任务；未来可按账号扩展并发，但同 `itemId` 必须加锁。
 
 ### FR-05 SKU 重建与校验

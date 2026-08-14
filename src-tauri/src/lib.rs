@@ -80,11 +80,15 @@ fn spawn_worker(app: &tauri::AppHandle) -> Result<Child, String> {
         .map_err(|error| format!("Unable to create worker data directory: {error}"))?;
 
     let node = worker_node(app);
+    let live_enabled = std::env::var("TMALL_LIVE_ENABLED").unwrap_or_else(|_| "true".to_string());
+    let live_contract = std::env::var("TMALL_LIVE_CONTRACT").unwrap_or_else(|_| "tmall-publish-v1".to_string());
     let mut command = Command::new(node);
     command
         .arg(script)
         .env("TMALL_DATA_DIR", app_data)
         .env("TMALL_WORKER_PORT", "19828")
+        .env("TMALL_LIVE_ENABLED", live_enabled)
+        .env("TMALL_LIVE_CONTRACT", live_contract)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

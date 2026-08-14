@@ -1,14 +1,14 @@
 {
   "name": "tmall-sku-worker",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "worker": "node worker/server.mjs",
-    "worker:test": "node --test tests/worker.test.mjs tests/import-parser.test.mjs",
+    "worker:test": "node --test tests/worker.test.mjs tests/import-parser.test.mjs tests/live-adapter.test.mjs",
     "test": "npm run worker:test",
     "prepare:runtime": "node scripts/prepare-runtime.mjs",
     "tauri": "tauri",

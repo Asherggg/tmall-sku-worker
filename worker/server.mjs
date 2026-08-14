@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { isLoggedInUrl } from "./browser-url.mjs";
+import { executeTmallRebuild } from "./tmall-live-adapter.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.TMALL_WORKER_PORT || 19828);
@@ -12,7 +13,7 @@ const HOST = process.env.TMALL_WORKER_HOST || "127.0.0.1";
 const DATA_DIR = process.env.TMALL_DATA_DIR || path.join(__dirname, "..", ".runtime", "tmall-worker");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const CONFIRMATION = "确认线上重建";
-const VERSION = "0.1.2";
+const VERSION = "0.1.3";
 const BROWSER_CDP_PORT = Number(process.env.TMALL_BROWSER_CDP_PORT || PORT + 1);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -30,7 +31,8 @@ function readState() {
 let state = readState();
 state.browser = { ...initialState().browser, ...state.browser, profile: initialState().browser.profile, visible: false, hidden: false, loggedIn: false };
 let activeBatchId = null;
-const pendingBatchIds = [];
+const pendingRuns = [];
+const scheduledRuns = new Map();
 let browserConnection = null;
 let browserContext = null;
 let browserPage = null;
@@ -39,6 +41,8 @@ let edgeProcess = null;
 const allowedOrigins = new Set([
   "http://127.0.0.1:5173",
   "http://localhost:5173",
+  "http://127.0.0.1:1420",
+  "http://localhost:1420",
   "tauri://localhost",
   "http://tauri.localhost",
 ]);
@@ -128,8 +132,16 @@ function taskResponse(task) {
   return { ...task, timeline: [...task.timeline] };
 }
 
+function unresolvedLiveWrite(itemId, exceptTaskId) {
+  return state.tasks.find((task) => task.itemId === String(itemId)
+    && task.id !== exceptTaskId
+    && task.liveWriteStarted === true
+    && task.status !== "succeeded");
+}
+
 function health() {
   const liveEnabled = process.env.TMALL_LIVE_ENABLED === "true";
+  const contractConfigured = process.env.TMALL_LIVE_CONTRACT === "tmall-publish-v1";
   return {
     ready: true,
     mode: liveEnabled ? "live" : "demo",
@@ -139,8 +151,9 @@ function health() {
     loggedIn: state.browser.loggedIn,
     riskRequired: state.browser.riskRequired,
     webdriver: state.browser.webdriver,
-    contract: liveEnabled ? (process.env.TMALL_LIVE_CONTRACT ? "configured" : "missing") : "demo",
-    message: liveEnabled && !process.env.TMALL_LIVE_CONTRACT ? "线上适配器未配置；演练可用，线上写入会进入人工复核" : undefined,
+    contract: liveEnabled ? (contractConfigured ? "configured" : "missing") : "demo",
+    unresolvedLiveWrites: state.tasks.filter((task) => task.liveWriteStarted === true && task.status !== "succeeded").length,
+    message: liveEnabled && !contractConfigured ? "线上适配器未配置；演练可用，线上写入会进入人工复核" : liveEnabled ? "线上重建适配器已就绪" : undefined,
   };
 }
 
@@ -400,7 +413,7 @@ async function runDemoTask(task) {
 }
 
 async function runLiveTask(task) {
-  if (process.env.TMALL_LIVE_ENABLED !== "true" || !process.env.TMALL_LIVE_CONTRACT) {
+  if (process.env.TMALL_LIVE_ENABLED !== "true" || process.env.TMALL_LIVE_CONTRACT !== "tmall-publish-v1") {
     task.status = "needs_manual_review";
     task.errorCode = "adapter_contract_missing";
     task.errorMessage = "线上适配器契约未配置，未发出任何写请求";
@@ -410,25 +423,101 @@ async function runLiveTask(task) {
     saveState();
     return;
   }
-  task.status = "needs_manual_review";
-  task.errorCode = "live_executor_not_enabled";
-  task.errorMessage = "当前构建只提供契约注入接口，未启用线上写执行器";
-  addTimeline(task, "needs_manual_review", task.errorMessage, "warning");
-  saveState();
+  try {
+    const verified = await verifyBrowser();
+    if (!verified.loggedIn || verified.riskRequired || verified.webdriver !== false) {
+      throw Object.assign(new Error(verified.riskRequired ? "检测到安全验证，未发出写请求" : "浏览器登录态未通过安全校验，未发出写请求"), { code: verified.riskRequired ? "browser_risk_required" : "browser_not_verified" });
+    }
+    const page = await connectSystemEdge();
+    if (!page) throw Object.assign(new Error("未找到专属 Edge 商品页"), { code: "browser_page_unavailable" });
+    const result = await executeTmallRebuild(page, task, {
+      onPhase(entry) {
+        task.status = entry.phase;
+        if (entry.progress != null) task.progress = entry.progress;
+        addTimeline(task, entry.phase, entry.message, entry.level);
+        addAudit(task, entry.phase, { method: "LOCAL", path: "worker://tmall-live-adapter" });
+        saveState();
+      },
+      onSnapshot(entry) {
+        if (entry.phase === "before") {
+          task.oldSkuIds = entry.summary.skuIds;
+          task.actualSkuCount = entry.summary.skuCount;
+          if (task.expectedSkuCount == null) task.expectedSkuCount = entry.summary.skuCount;
+          task.snapshotBefore = entry.summary;
+        } else if (entry.phase === "after") {
+          task.newSkuIds = entry.summary.skuIds;
+          task.snapshotAfter = entry.summary;
+          task.fieldComparison = entry.comparison;
+        } else {
+          task.newSkuIds = entry.summary.skuIds;
+        }
+        saveState();
+      },
+      onRecoverySnapshot(snapshot) {
+        task.recoverySnapshot = snapshot;
+        saveState();
+      },
+      onWriteStart(entry) {
+        task.liveWriteStarted = true;
+        task.writePhase = entry.phase;
+        saveState();
+      },
+      onNetwork(entry) {
+        addAudit(task, entry.phase, { method: entry.method, path: entry.path, status: entry.status, businessCode: entry.classification.businessCode });
+        saveState();
+      },
+    });
+    task.oldSkuIds = result.oldSkuIds;
+    task.newSkuIds = result.newSkuIds;
+    task.status = "succeeded";
+    task.progress = 100;
+    task.errorCode = undefined;
+    task.errorMessage = undefined;
+    addTimeline(task, "final_verified", `线上重建完成：${result.skuCount} 个 SKU 已生成新 ID，字段回读一致`, "success");
+    addAudit(task, "final_verified", { method: "GET", path: "/tmall/publish.htm", status: 200, businessCode: "SUCCESS" });
+    saveState();
+  } catch (error) {
+    task.status = "needs_manual_review";
+    task.errorCode = error.code || "live_rebuild_failed";
+    task.errorMessage = error.message || "线上重建未能确认成功";
+    addTimeline(task, "needs_manual_review", `${task.errorMessage}。不会自动重试未知写入`, "error");
+    addAudit(task, "blocked", { method: "BLOCKED", path: "worker://tmall-live-adapter", status: error.status, businessCode: error.businessCode || task.errorCode });
+    saveState();
+  }
 }
 
-async function runBatch(batch) {
+async function runBatch(batch, selectedTaskIds = batch.taskIds) {
   if (activeBatchId) {
-    if (!pendingBatchIds.includes(batch.id)) pendingBatchIds.push(batch.id);
+    const pending = pendingRuns.find((entry) => entry.batchId === batch.id);
+    if (pending) pending.taskIds = [...new Set([...pending.taskIds, ...selectedTaskIds])];
+    else pendingRuns.push({ batchId: batch.id, taskIds: selectedTaskIds });
     return;
   }
   activeBatchId = batch.id;
   batch.status = "running";
   saveState();
   try {
-    for (const taskId of batch.taskIds) {
+    for (const taskId of selectedTaskIds) {
       const task = state.tasks.find((entry) => entry.id === taskId);
-      if (!task || task.status === "succeeded") continue;
+      if (!task || !["planned", "queued"].includes(task.status)) continue;
+      const conflictingWrite = task.mode === "live" ? unresolvedLiveWrite(task.itemId, task.id) : null;
+      if (conflictingWrite) {
+        task.status = "needs_manual_review";
+        task.errorCode = "item_write_unresolved";
+        task.errorMessage = `商品 ${task.itemId} 存在未确认的线上写入任务 ${conflictingWrite.id}，本任务未执行`;
+        addTimeline(task, "needs_manual_review", task.errorMessage, "warning");
+        addAudit(task, "blocked", { method: "BLOCKED", path: "worker://item-write-lock", businessCode: task.errorCode });
+        saveState();
+        continue;
+      }
+      if (task.mode === "live" && task.liveWriteStarted) {
+        task.status = "needs_manual_review";
+        task.errorCode = "manual_recovery_required";
+        task.errorMessage = "任务已进入过写入阶段，禁止自动重跑；请先核对服务端状态";
+        addTimeline(task, "needs_manual_review", task.errorMessage, "warning");
+        saveState();
+        continue;
+      }
       task.status = "queued";
       task.attempts += 1;
       addTimeline(task, "queued", "已进入单商品写入队列", "info");
@@ -441,20 +530,32 @@ async function runBatch(batch) {
     saveState();
   } finally {
     activeBatchId = null;
-    const nextBatchId = pendingBatchIds.shift();
-    if (nextBatchId) {
-      const nextBatch = state.batches.find((entry) => entry.id === nextBatchId);
-      if (nextBatch) queueMicrotask(() => runBatch(nextBatch));
+    const nextRun = pendingRuns.shift();
+    if (nextRun) {
+      const nextBatch = state.batches.find((entry) => entry.id === nextRun.batchId);
+      if (nextBatch) queueMicrotask(() => runBatch(nextBatch, nextRun.taskIds));
     }
   }
 }
 
-function enqueueBatch(batch) {
+function enqueueBatch(batch, selectedTaskIds = batch.taskIds) {
   if (activeBatchId) {
-    if (!pendingBatchIds.includes(batch.id)) pendingBatchIds.push(batch.id);
+    const pending = pendingRuns.find((entry) => entry.batchId === batch.id);
+    if (pending) pending.taskIds = [...new Set([...pending.taskIds, ...selectedTaskIds])];
+    else pendingRuns.push({ batchId: batch.id, taskIds: selectedTaskIds });
     return;
   }
-  queueMicrotask(() => runBatch(batch));
+  const scheduled = scheduledRuns.get(batch.id);
+  if (scheduled) {
+    for (const taskId of selectedTaskIds) scheduled.add(taskId);
+    return;
+  }
+  scheduledRuns.set(batch.id, new Set(selectedTaskIds));
+  queueMicrotask(() => {
+    const taskIds = [...(scheduledRuns.get(batch.id) || [])];
+    scheduledRuns.delete(batch.id);
+    runBatch(batch, taskIds);
+  });
 }
 
 async function route(request, response) {
@@ -480,6 +581,18 @@ async function route(request, response) {
       const mode = payload.mode === "live" ? "live" : "demo";
       if (mode === "live" && payload.confirmation !== CONFIRMATION) errors.push("线上模式需要确认词");
       if (errors.length) return json(response, 400, { error: "validation_error", errors }, rid);
+      if (mode === "live") {
+        const conflicts = payload.items
+          .map((item) => unresolvedLiveWrite(String(item.itemId)))
+          .filter(Boolean);
+        if (conflicts.length) {
+          return json(response, 409, {
+            error: "item_write_unresolved",
+            message: "商品存在未确认的线上写入，禁止创建新的线上任务",
+            items: [...new Set(conflicts.map((task) => task.itemId))],
+          }, rid);
+        }
+      }
       const batchId = id("batch");
       const createdAt = now();
       const taskIds = [];
@@ -500,6 +613,22 @@ async function route(request, response) {
       if (!batch) return json(response, 404, { error: "batch_not_found" }, rid);
       const payload = await body(request);
       if (batch.mode === "live" && payload.confirmation !== CONFIRMATION) return json(response, 400, { error: "confirmation_required" }, rid);
+      if (batch.mode === "live" && batch.status !== "queued") return json(response, 409, { error: "batch_not_startable", message: "线上批次只能启动一次；请从任务状态判断后续处理" }, rid);
+      if (batch.mode === "live") {
+        const conflicts = batch.taskIds
+          .map((taskId) => state.tasks.find((task) => task.id === taskId))
+          .filter(Boolean)
+          .filter((task) => (task.liveWriteStarted === true && task.status !== "succeeded") || unresolvedLiveWrite(task.itemId, task.id));
+        if (conflicts.length) {
+          return json(response, 409, {
+            error: "item_write_unresolved",
+            message: "批次包含存在未确认线上写入的商品，禁止启动",
+            items: [...new Set(conflicts.map((task) => task.itemId))],
+          }, rid);
+        }
+        batch.status = "running";
+        saveState();
+      }
       enqueueBatch(batch);
       return json(response, 202, { accepted: true, batchId }, rid);
     }
@@ -508,18 +637,24 @@ async function route(request, response) {
       const task = state.tasks.find((entry) => entry.id === taskId);
       if (!task) return json(response, 404, { error: "task_not_found" }, rid);
       if (action === "pause") {
+        if (task.mode === "live") return json(response, 409, { error: "live_task_not_pausable", message: "线上任务启动后必须完成恢复与回读，不能中途暂停" }, rid);
         if (["succeeded", "failed", "needs_manual_review"].includes(task.status)) return json(response, 409, { error: "task_not_running" }, rid);
         task.pauseRequested = true;
         addTimeline(task, "pause_requested", "已请求在下一个安全边界暂停", "warning");
       } else {
         if (!["failed", "needs_manual_review", "paused"].includes(task.status)) return json(response, 409, { error: "task_not_retryable" }, rid);
+        if (task.mode === "live" && task.liveWriteStarted) return json(response, 409, { error: "manual_recovery_required", message: "任务已进入过写入阶段，禁止自动重跑；请先核对服务端状态" }, rid);
+        if (task.mode === "live" && unresolvedLiveWrite(task.itemId, task.id)) return json(response, 409, { error: "item_write_unresolved", message: "同商品存在未确认的线上写入，禁止重试" }, rid);
         task.status = "queued";
         task.errorCode = undefined;
         task.errorMessage = undefined;
         task.progress = 0;
         addTimeline(task, "queued", "已重新加入队列", "info");
         const batch = state.batches.find((entry) => entry.id === task.batchId);
-        if (batch) enqueueBatch(batch);
+        if (batch) {
+          batch.status = "queued";
+          enqueueBatch(batch, [task.id]);
+        }
       }
       saveState();
       return json(response, 202, { accepted: true }, rid);

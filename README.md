@@ -16,7 +16,7 @@ $env:TMALL_DATA_DIR = "$PWD\\.runtime\\tmall-worker"
 npm run worker
 ```
 
-The console defaults to **demo mode**. Demo tasks exercise the complete queue, two-phase rebuild state machine, readback, pause/retry, and audit UI without modifying Tmall. Live mode is intentionally disabled unless the worker is started with `TMALL_LIVE_ENABLED=true` and a reviewed adapter contract; the current MVP reports the missing contract instead of guessing an internal endpoint.
+The source worker defaults to **demo mode**. Demo tasks exercise the complete queue, two-phase rebuild state machine, readback, pause/retry, and audit UI without modifying Tmall. The Windows v0.1.3 desktop build enables the reviewed `tmall-publish-v1` adapter and still requires the exact confirmation phrase `确认线上重建` before a live batch can start.
 
 ## Browser lifecycle
 
@@ -28,7 +28,11 @@ This v2 profile is intentionally separate from the earlier Playwright-launched p
 
 `npm run tauri:build` produces a Windows NSIS installer (and MSI when the local WiX toolchain is available). The NSIS wizard supports choosing a per-user installation directory, so no administrator account is required by default. The installer bundles the Node runtime and the two Playwright packages used by the Worker; an installed copy does not depend on Node being present on `PATH`.
 
-The app still requires Microsoft Edge and WebView2 on Windows. Login is performed manually in the dedicated headed Edge profile. The default mode is demo; live Tmall writes remain disabled unless a reviewed adapter contract and the explicit confirmation gate are present.
+The app still requires Microsoft Edge and WebView2 on Windows. Login is performed manually in the dedicated headed Edge profile. The v0.1.3 installer is the live rebuild edition: it reads the current item form from the logged-in page, performs a temporary unique-spec submit, reloads to capture new SKU IDs, restores the original fields, submits again, and reloads for final readback. It invokes the page's internal submit event and same-origin HTTP APIs; it does not simulate DOM clicks.
+
+Live execution remains fail-closed. A CAPTCHA/risk page, invalid channel value, local validation error, HTTP/business error, unknown submit response, ID mismatch, or field mismatch moves the task to `needs_manual_review` and is never blindly retried.
+
+Before upgrading, exit the older desktop process so it releases loopback port `19828`. The v0.1.3 UI checks the connected Worker version and disables live mode when an older Worker or an unconfigured contract is still running.
 
 ## Verification
 

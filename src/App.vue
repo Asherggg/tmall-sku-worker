@@ -35,6 +35,7 @@ import {
 import type { BatchRecord, ImportPreview, TaskRecord, WorkerHealth } from "./types";
 
 type View = "overview" | "import" | "queue" | "browser" | "audit";
+const EXPECTED_WORKER_VERSION = "0.1.3";
 
 const view = ref<View>("overview");
 const health = ref<WorkerHealth>({ ready: false, mode: "demo", workerVersion: "-", browser: "unavailable", profile: "-", loggedIn: false, contract: "demo" });
@@ -50,6 +51,16 @@ const isSubmitting = ref(false);
 let refreshTimer: number | undefined;
 
 const preview = computed<ImportPreview>(() => parseImport(importText.value));
+const liveRuntimeReady = computed(() => health.value.ready
+  && health.value.workerVersion === EXPECTED_WORKER_VERSION
+  && health.value.mode === "live"
+  && health.value.contract === "configured");
+const liveRuntimeMessage = computed(() => {
+  if (!health.value.ready) return "Worker 未启动，不能执行线上任务";
+  if (health.value.workerVersion !== EXPECTED_WORKER_VERSION) return `当前连接的是旧 Worker ${health.value.workerVersion}，请退出旧版后重新打开 0.1.3`;
+  if (health.value.mode !== "live" || health.value.contract !== "configured") return "当前 Worker 未启用 tmall-publish-v1 线上适配器";
+  return "";
+});
 const hasPendingSkuLookup = computed(() => preview.value.items.some((item) => !item.skuIds.length && item.expectedSkuCount == null));
 const runningTasks = computed(() => tasks.value.filter((task) => ["queued", "reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying"].includes(task.status)));
 const succeededTasks = computed(() => tasks.value.filter((task) => task.status === "succeeded"));
@@ -84,6 +95,10 @@ async function refresh(silent = false) {
 async function handleCreateBatch() {
   if (!preview.value.valid || isSubmitting.value) return;
   if (mode.value === "live") {
+    if (!liveRuntimeReady.value) {
+      ElMessage.error(liveRuntimeMessage.value);
+      return;
+    }
     if (confirmation.value !== "确认线上重建") {
       ElMessage.warning("请输入确认词：确认线上重建");
       return;
@@ -230,7 +245,7 @@ onUnmounted(() => {
       <header class="topbar">
         <div><span class="eyebrow">WORKSPACE / {{ view.toUpperCase() }}</span><h1>{{ navItems.find((item) => item.id === view)?.label }}</h1></div>
         <div class="top-actions">
-          <span class="connection-state"><i :class="['dot', health.ready ? 'ok' : 'warn']" />{{ health.ready ? "Worker 在线" : "演练模式" }}</span>
+          <span class="connection-state"><i :class="['dot', health.ready ? 'ok' : 'warn']" />{{ health.ready ? "Worker 在线" : "Worker 离线" }}</span>
           <button class="icon-button" title="刷新状态" :disabled="isRefreshing" @click="refresh()"><RefreshCw :size="17" :class="{ spinning: isRefreshing }" /></button>
         </div>
       </header>
@@ -274,16 +289,17 @@ onUnmounted(() => {
             <div class="preview-stat"><span>商品数</span><strong>{{ preview.items.length }}</strong></div>
             <div class="preview-stat"><span>SKU 数</span><strong>{{ hasPendingSkuLookup ? '待读取' : preview.skuCount }}</strong></div>
             <div class="preview-items"><div v-for="item in preview.items" :key="item.itemId" class="preview-item"><span class="mono">{{ item.itemId }}</span><span>{{ skuCountLabel(item) }} SKU</span></div><span v-if="!preview.items.length" class="empty-copy">导入后显示商品分组</span></div>
-            <div class="mode-switch"><span>运行模式</span><div class="segmented"><button :class="{ selected: mode === 'demo' }" @click="mode = 'demo'">演练</button><button :class="{ selected: mode === 'live' }" @click="mode = 'live'">线上</button></div></div>
+            <div class="mode-switch"><span>运行模式</span><div class="segmented"><button :class="{ selected: mode === 'demo' }" @click="mode = 'demo'">演练</button><button :class="{ selected: mode === 'live' }" :disabled="!liveRuntimeReady" :title="liveRuntimeMessage" @click="mode = 'live'">线上</button></div></div>
+            <span v-if="!liveRuntimeReady" class="error-line">{{ liveRuntimeMessage }}</span>
             <div v-if="mode === 'live'" class="live-gate"><CircleAlert :size="16" /><div><strong>线上写入已锁定</strong><p>输入确认词后才能创建批次：<span class="mono">确认线上重建</span></p><el-input v-model="confirmation" placeholder="输入确认词" /></div></div>
-            <button class="primary-button full-button" :disabled="!preview.valid || isSubmitting || (mode === 'live' && confirmation !== '确认线上重建')" @click="handleCreateBatch"><Play :size="16" />{{ isSubmitting ? '创建中…' : mode === 'demo' ? '创建演练批次' : '创建线上批次' }}</button>
+            <button class="primary-button full-button" :disabled="!preview.valid || isSubmitting || (mode === 'live' && (!liveRuntimeReady || confirmation !== '确认线上重建'))" @click="handleCreateBatch"><Play :size="16" />{{ isSubmitting ? '创建中…' : mode === 'demo' ? '创建演练批次' : '创建线上批次' }}</button>
           </div>
         </div>
       </section>
 
       <section v-else-if="view === 'queue'" class="content-view">
         <div class="section-heading"><div><span class="eyebrow">QUEUE</span><h2>任务队列</h2></div><div class="heading-actions"><button class="outline-button" @click="view = 'import'"><Upload :size="15" />新建批次</button><button v-if="activeBatch && activeBatch.status === 'queued'" class="primary-button" @click="handleStartBatch"><Play :size="15" />启动队列</button></div></div>
-        <div class="queue-toolbar"><span>{{ tasks.length }} 个商品任务</span><span class="toolbar-divider" /><span>同商品不并发写入</span><span class="toolbar-spacer" /><el-tag v-if="health.contract === 'missing'" type="warning" size="small">线上适配器未配置</el-tag></div>
+        <div class="queue-toolbar"><span>{{ tasks.length }} 个商品任务</span><span class="toolbar-divider" /><span>同商品不并发写入</span><span class="toolbar-spacer" /><el-tag v-if="health.unresolvedLiveWrites" type="danger" size="small">{{ health.unresolvedLiveWrites }} 个线上写入待核对</el-tag><el-tag v-else-if="health.contract === 'missing'" type="warning" size="small">线上适配器未配置</el-tag></div>
         <div class="table-frame queue-table">
           <el-table :data="tasks" empty-text="还没有任务" table-layout="fixed" @row-click="openTask">
             <el-table-column prop="itemId" label="商品 ID" width="165" />
@@ -292,7 +308,7 @@ onUnmounted(() => {
             <el-table-column label="状态" width="150"><template #default="scope"><el-tag size="small" :type="statusType(scope.row.status)">{{ statusLabel(scope.row.status) }}</el-tag></template></el-table-column>
             <el-table-column label="阶段"><template #default="scope"><span>{{ scope.row.phaseLabel }}</span><small v-if="scope.row.errorMessage" class="error-line">{{ scope.row.errorMessage }}</small></template></el-table-column>
             <el-table-column label="进度" width="170"><template #default="scope"><el-progress :percentage="scope.row.progress" :status="scope.row.status === 'succeeded' ? 'success' : undefined" :stroke-width="6" /></template></el-table-column>
-            <el-table-column label="操作" width="150"><template #default="scope"><div class="row-actions"><button v-if="runningTasks.includes(scope.row)" class="table-icon" title="暂停" @click.stop="handlePause(scope.row)"><Pause :size="15" /></button><button v-if="['failed','needs_manual_review'].includes(scope.row.status)" class="table-icon" title="重试" @click.stop="handleRetry(scope.row)"><RotateCcw :size="15" /></button><button class="table-icon" title="查看详情" @click.stop="openTask(scope.row)"><ArrowDownToLine :size="15" /></button></div></template></el-table-column>
+            <el-table-column label="操作" width="170"><template #default="scope"><div class="row-actions"><button v-if="scope.row.mode === 'demo' && runningTasks.includes(scope.row)" class="table-icon" title="暂停" @click.stop="handlePause(scope.row)"><Pause :size="15" /></button><button v-if="['failed','needs_manual_review'].includes(scope.row.status) && !(scope.row.mode === 'live' && scope.row.liveWriteStarted)" class="table-icon" title="重试" @click.stop="handleRetry(scope.row)"><RotateCcw :size="15" /></button><el-tag v-if="scope.row.mode === 'live' && scope.row.liveWriteStarted && scope.row.status === 'needs_manual_review'" type="danger" size="small">仅人工复核</el-tag><button class="table-icon" title="查看详情" @click.stop="openTask(scope.row)"><ArrowDownToLine :size="15" /></button></div></template></el-table-column>
           </el-table>
         </div>
       </section>

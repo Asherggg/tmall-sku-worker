@@ -24,6 +24,46 @@ async function waitForWorker() {
   throw new Error("worker did not start");
 }
 
+async function waitForWorkerAt(workerPort) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${workerPort}/health`);
+      if (response.ok) return;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`worker on ${workerPort} did not start`);
+}
+
+function spawnWorker(workerPort, workerDataDir, extraEnv = {}) {
+  return spawn(process.execPath, [path.join(root, "worker", "server.mjs")], {
+    cwd: root,
+    env: { ...process.env, TMALL_WORKER_PORT: String(workerPort), TMALL_DATA_DIR: workerDataDir, ...extraEnv },
+    stdio: "ignore",
+  });
+}
+
+async function stopWorker(processHandle) {
+  if (!processHandle || processHandle.exitCode != null) return;
+  await new Promise((resolve) => {
+    processHandle.once("exit", resolve);
+    processHandle.kill();
+    setTimeout(resolve, 1500).unref();
+  });
+}
+
+async function waitForTask(taskId, predicate, workerPort = port) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const response = await fetch(`http://127.0.0.1:${workerPort}/tasks/${taskId}`);
+    const task = await response.json();
+    if (response.ok && predicate(task)) return task;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`task ${taskId} did not reach expected state`);
+}
+
 test.before(async () => {
   child = spawn(process.execPath, [path.join(root, "worker", "server.mjs")], {
     cwd: root,
@@ -81,6 +121,19 @@ test("live mode requires the explicit confirmation phrase", async () => {
   assert.equal(payload.error, "validation_error");
 });
 
+test("live tasks cannot be paused after creation", async () => {
+  const create = await fetch(`http://127.0.0.1:${port}/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode: "live", confirmation: "确认线上重建", items: [{ itemId: "10009", skuIds: ["20010"] }] }),
+  });
+  assert.equal(create.status, 201);
+  const { tasks } = await create.json();
+  const pause = await fetch(`http://127.0.0.1:${port}/tasks/${tasks[0].id}/pause`, { method: "POST" });
+  assert.equal(pause.status, 409);
+  assert.equal((await pause.json()).error, "live_task_not_pausable");
+});
+
 test("invalid item IDs are rejected before queueing", async () => {
   const response = await fetch(`http://127.0.0.1:${port}/tasks`, {
     method: "POST",
@@ -96,6 +149,14 @@ test("disallowed browser origins cannot call the local worker", async () => {
   });
   assert.equal(response.status, 403);
   assert.equal((await response.json()).error, "origin_not_allowed");
+});
+
+test("Tauri production and dev origins can call the worker", async () => {
+  for (const origin of ["tauri://localhost", "http://tauri.localhost", "http://127.0.0.1:1420", "http://localhost:1420"]) {
+    const response = await fetch(`http://127.0.0.1:${port}/health`, { headers: { origin } });
+    assert.equal(response.status, 200, origin);
+    assert.equal(response.headers.get("access-control-allow-origin"), origin);
+  }
 });
 
 test("expected SKU count must match the supplied SKU IDs", async () => {
@@ -139,8 +200,136 @@ test("concurrent demo batches are queued and both finish", async () => {
   assert.equal(first.status, 201);
   assert.equal(second.status, 201);
   const [{ batchId: firstId }, { batchId: secondId }] = await Promise.all([first.json(), second.json()]);
-  await new Promise((resolve) => setTimeout(resolve, 2500));
-  const { tasks } = await (await fetch(`http://127.0.0.1:${port}/tasks`)).json();
+  const deadline = Date.now() + 8000;
+  let tasks = [];
+  while (Date.now() < deadline) {
+    ({ tasks } = await (await fetch(`http://127.0.0.1:${port}/tasks`)).json());
+    if ([firstId, secondId].every((batchId) => tasks.find((entry) => entry.batchId === batchId)?.status === "succeeded")) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
   assert.equal(tasks.find((entry) => entry.batchId === firstId)?.status, "succeeded");
   assert.equal(tasks.find((entry) => entry.batchId === secondId)?.status, "succeeded");
+});
+
+test("a live batch accepts only one concurrent start", async () => {
+  const create = await fetch(`http://127.0.0.1:${port}/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode: "live", confirmation: "确认线上重建", items: [{ itemId: "10006", skuIds: ["20007"] }] }),
+  });
+  const { batchId } = await create.json();
+  const start = () => fetch(`http://127.0.0.1:${port}/batches/${batchId}/start`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ confirmation: "确认线上重建" }),
+  });
+  const responses = await Promise.all([start(), start()]);
+  assert.deepEqual(responses.map((response) => response.status).sort(), [202, 409]);
+  const batches = await (await fetch(`http://127.0.0.1:${port}/batches`)).json();
+  assert.notEqual(batches.batches.find((batch) => batch.id === batchId)?.status, "starting");
+});
+
+test("retry runs only the queued task and does not replay sibling manual-review tasks", async () => {
+  const create = await fetch(`http://127.0.0.1:${port}/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      mode: "live",
+      confirmation: "确认线上重建",
+      items: [
+        { itemId: "10007", skuIds: ["20008"] },
+        { itemId: "10008", skuIds: ["20009"] },
+      ],
+    }),
+  });
+  const created = await create.json();
+  const [target, sibling] = created.tasks;
+  await fetch(`http://127.0.0.1:${port}/batches/${created.batchId}/start`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ confirmation: "确认线上重建" }),
+  });
+  await waitForTask(target.id, (task) => task.status === "needs_manual_review");
+  await waitForTask(sibling.id, (task) => task.status === "needs_manual_review");
+
+  const retry = await fetch(`http://127.0.0.1:${port}/tasks/${target.id}/retry`, { method: "POST" });
+  assert.equal(retry.status, 202);
+  const retried = await waitForTask(target.id, (task) => task.attempts === 2 && task.status === "needs_manual_review");
+  const untouched = await (await fetch(`http://127.0.0.1:${port}/tasks/${sibling.id}`)).json();
+  assert.equal(retried.attempts, 2);
+  assert.equal(untouched.attempts, 1);
+});
+
+test("an unresolved live write survives restart and locks the item", async () => {
+  const isolatedPort = port + 200;
+  const isolatedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmall-worker-lock-test-"));
+  const createdAt = new Date().toISOString();
+  fs.writeFileSync(path.join(isolatedDataDir, "state.json"), `${JSON.stringify({
+    batches: [
+      { id: "old_batch", mode: "live", status: "failed", taskIds: ["old_task"], createdAt },
+      { id: "waiting_batch", mode: "live", status: "queued", taskIds: ["waiting_task"], createdAt },
+    ],
+    tasks: [{
+      id: "old_task",
+      batchId: "old_batch",
+      itemId: "828872681901",
+      skuIds: [],
+      mode: "live",
+      status: "needs_manual_review",
+      liveWriteStarted: true,
+      attempts: 1,
+      progress: 50,
+      createdAt,
+      updatedAt: createdAt,
+      timeline: [],
+    }, {
+      id: "waiting_task",
+      batchId: "waiting_batch",
+      itemId: "828872681901",
+      skuIds: [],
+      mode: "live",
+      status: "planned",
+      attempts: 0,
+      progress: 0,
+      createdAt,
+      updatedAt: createdAt,
+      timeline: [],
+    }],
+    audit: [],
+    browser: {},
+  }, null, 2)}\n`, "utf8");
+
+  let isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, { TMALL_LIVE_ENABLED: "true", TMALL_LIVE_CONTRACT: "tmall-publish-v1" });
+  try {
+    await waitForWorkerAt(isolatedPort);
+    assert.equal((await (await fetch(`http://127.0.0.1:${isolatedPort}/health`)).json()).unresolvedLiveWrites, 1);
+    await stopWorker(isolatedChild);
+    isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, { TMALL_LIVE_ENABLED: "true", TMALL_LIVE_CONTRACT: "tmall-publish-v1" });
+    await waitForWorkerAt(isolatedPort);
+
+    const blockedStart = await fetch(`http://127.0.0.1:${isolatedPort}/batches/waiting_batch/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ confirmation: "确认线上重建" }),
+    });
+    assert.equal(blockedStart.status, 409);
+    assert.equal((await blockedStart.json()).error, "item_write_unresolved");
+
+    const blocked = await fetch(`http://127.0.0.1:${isolatedPort}/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "live", confirmation: "确认线上重建", items: [{ itemId: "828872681901", skuIds: [] }] }),
+    });
+    assert.equal(blocked.status, 409);
+    assert.equal((await blocked.json()).error, "item_write_unresolved");
+
+    const unrelated = await fetch(`http://127.0.0.1:${isolatedPort}/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "live", confirmation: "确认线上重建", items: [{ itemId: "828872681902", skuIds: [] }] }),
+    });
+    assert.equal(unrelated.status, 201);
+  } finally {
+    await stopWorker(isolatedChild);
+  }
 });

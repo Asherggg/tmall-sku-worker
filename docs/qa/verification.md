@@ -8,13 +8,18 @@
 - Invalid item IDs and SKU-count mismatches are rejected.
 - Requests from disallowed browser origins are rejected.
 - Concurrent batches serialize and both complete.
+- Live item locks survive Worker restart; a retry runs only the selected task.
+- Both submit phases re-read and validate the page's actual form state before emitting the internal submit event.
+- Automated suite: 33/33 passed for v0.1.3.
 
 ## Build
 
 - Vue/TypeScript production build passes.
 - Rust `cargo check` passes.
 - Tauri release executable builds at `src-tauri/target/release/tmall-sku-worker.exe`.
-- MSI generation did not complete because the WiX binary download timed out; application compilation itself succeeded.
+- NSIS installer builds at `src-tauri/target/release/bundle/nsis/Tmall SKU Worker_0.1.3_x64-setup.exe`.
+- Silent custom-directory installation completed successfully. Installed Worker sources match the repository by SHA-256, and the bundled Node runtime imports Playwright 1.62.1.
+- The installed Worker smoke check returned `workerVersion=0.1.3`, `mode=live`, and `contract=configured` on an isolated loopback port.
 
 ## UI smoke
 
@@ -30,4 +35,4 @@ Playwright launched the installed Edge channel headlessly, loaded the console, c
 
 ## Deliberate boundary
 
-The generic live Tmall executor is not enabled. The worker records `adapter_contract_missing` or `live_executor_not_enabled` and sends no write request. A real adapter requires a versioned submit contract plus post-submit readback fixtures for each supported page schema.
+The v0.1.3 desktop build enables the versioned `tmall-publish-v1` executor. Unit tests cover channel allowlisting, HTTP-200 business-error classification, unknown-response fail-closed behavior, page-state mutation detection, two-phase navigation/readback, exact ID mapping, item-level write locks, and semantic SKU comparison. Installer verification does not execute a real product write; acceptance still requires one confirmed test item to complete temporary submit/readback, restore/final submit, and final field/ID readback.
