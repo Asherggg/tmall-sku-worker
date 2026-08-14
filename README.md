@@ -35,6 +35,7 @@ The app still requires Microsoft Edge and WebView2 on Windows. Login is performe
 ```powershell
 npm test
 npm run build
+npm run prepare:runtime
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 

@@ -27,6 +27,7 @@ Read the relevant contract before changing that area. Update the contract when a
 npm install
 npm run dev
 npm run worker
+npm run prepare:runtime
 npm run tauri:dev
 npm run tauri:build
 ```
@@ -38,6 +39,7 @@ Run the narrowest relevant checks, then the full baseline for cross-layer change
 ```powershell
 npm test
 npm run build
+npm run prepare:runtime
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
