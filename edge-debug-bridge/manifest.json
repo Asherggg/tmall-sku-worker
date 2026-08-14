@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Tmall Publish Local Debug Bridge",
+  "version": "0.3.0",
+  "description": "Temporary local-only, read-only debugger bridge for one Tmall publish tab.",
+  "permissions": ["debugger", "tabs", "alarms", "storage"],
+  "host_permissions": [
+    "http://127.0.0.1:19827/*",
+    "http://localhost:19827/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  }
+}

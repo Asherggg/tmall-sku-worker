@@ -1,0 +1,13 @@
+.runtime/
+.playwright-cli/
+node_modules/
+dist/
+logs/
+src-tauri/target/
+src-tauri/resources/
+workspace/
+agent-lanes.md
+inventory_api_recon.txt
+.env
+.env.*
+!.env.example

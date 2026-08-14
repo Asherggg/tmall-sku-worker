@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Tmall SKU Worker",
+  "version": "0.1.2",
+  "identifier": "com.local.tmall-sku-worker",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build && npm run prepare:runtime",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Tmall SKU Worker",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 1040,
+        "minHeight": 680,
+        "center": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:19828; img-src 'self' asset: data: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "nsis"],
+    "resources": {
+      "../worker/server.mjs": "worker/server.mjs",
+      "../worker/browser-url.mjs": "worker/browser-url.mjs",
+      "resources/node.exe": "runtime/node.exe",
+      "resources/node_modules": "node_modules"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      },
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
+    }
+  }
+}
