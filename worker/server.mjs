@@ -13,7 +13,8 @@ const HOST = process.env.TMALL_WORKER_HOST || "127.0.0.1";
 const DATA_DIR = process.env.TMALL_DATA_DIR || path.join(__dirname, "..", ".runtime", "tmall-worker");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const CONFIRMATION = "确认线上重建";
-const VERSION = "0.1.7";
+const VERSION = "0.1.8";
+const DEFAULT_LOGIN_URL = "https://myseller.taobao.com/home.htm/QnworkbenchHome/";
 const BROWSER_CDP_PORT = Number(process.env.TMALL_BROWSER_CDP_PORT || PORT + 1);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -260,7 +261,7 @@ async function ensurePlaywrightBrowser({ visible }) {
   }
   browserPage = browserContext.pages()[0] || await browserContext.newPage();
   if (visible && (!browserPage.url() || browserPage.url() === "about:blank")) {
-    await browserPage.goto(process.env.TMALL_LOGIN_URL || "https://sell.publish.tmall.com/", { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+    await browserPage.goto(process.env.TMALL_LOGIN_URL || DEFAULT_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
   }
   state.browser.visible = visible;
   state.browser.hidden = !visible;
@@ -293,7 +294,7 @@ async function openLoginBrowser() {
     "--remote-debugging-address=127.0.0.1",
     `--remote-debugging-port=${BROWSER_CDP_PORT}`,
     `--remote-allow-origins=http://127.0.0.1:${BROWSER_CDP_PORT}`,
-    process.env.TMALL_LOGIN_URL || "https://sell.publish.tmall.com/",
+    process.env.TMALL_LOGIN_URL || DEFAULT_LOGIN_URL,
   ], { stdio: "ignore", windowsHide: false });
   edgeProcess.unref();
   edgeProcess.once("exit", () => {

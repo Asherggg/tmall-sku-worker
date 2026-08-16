@@ -12,7 +12,7 @@
 - Both submit phases serialize and validate the intended form before direct HTTP submission.
 - Snapshot, preview, both submits, and readback use the authenticated API request context without page evaluation, events, reloads, or navigation.
 - Malformed bootstrap and canonical mapping failures fail closed without a page-operation fallback.
-- Automated suite: 37/37 passed for v0.1.7.
+- Automated suite: 37/37 passed for v0.1.8.
 
 ## Build
 
@@ -37,4 +37,4 @@ Playwright launched the installed Edge channel headlessly, loaded the console, c
 
 ## Deliberate boundary
 
-The v0.1.7 source enables the versioned `tmall-publish-v2` pure-HTTP executor. Unit tests cover the direct submit form contract, XSRF/header handling, absence of page evaluation/events/navigation, channel allowlisting, HTTP-200 business-error classification, unknown-response fail-closed behavior, bootstrap-only readback, exact ID mapping, item-level write locks, and semantic SKU comparison. The latest installed-package smoke evidence above remains from v0.1.6; v0.1.7 still requires packaging plus one confirmed test item before release acceptance.
+The v0.1.8 source enables the versioned `tmall-publish-v2` pure-HTTP executor and the seller-workbench login entrypoint. Unit tests cover the direct submit form contract, XSRF/header handling, absence of page evaluation/events/navigation, channel allowlisting, HTTP-200 business-error classification, unknown-response fail-closed behavior, bootstrap-only readback, exact ID mapping, item-level write locks, and semantic SKU comparison. A real live item still requires a separate confirmed acceptance run.

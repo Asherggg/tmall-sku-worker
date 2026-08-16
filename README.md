@@ -16,7 +16,7 @@ $env:TMALL_DATA_DIR = "$PWD\\.runtime\\tmall-worker"
 npm run worker
 ```
 
-The source worker defaults to **demo mode**. Demo tasks exercise the complete queue, two-phase rebuild state machine, readback, pause/retry, and audit UI without modifying Tmall. The Windows v0.1.7 desktop build enables the reviewed `tmall-publish-v2` pure-HTTP adapter and still requires the exact confirmation phrase `确认线上重建` before a live batch can start.
+The source worker defaults to **demo mode**. Demo tasks exercise the complete queue, two-phase rebuild state machine, readback, pause/retry, and audit UI without modifying Tmall. The Windows v0.1.8 desktop build enables the reviewed `tmall-publish-v2` pure-HTTP adapter and still requires the exact confirmation phrase `确认线上重建` before a live batch can start.
 
 ## Browser lifecycle
 
@@ -28,11 +28,11 @@ This v2 profile is intentionally separate from the earlier Playwright-launched p
 
 `npm run tauri:build` produces a Windows NSIS installer (and MSI when the local WiX toolchain is available). The NSIS wizard supports choosing a per-user installation directory, so no administrator account is required by default. The installer bundles the Node runtime and the two Playwright packages used by the Worker; an installed copy does not depend on Node being present on `PATH`.
 
-The app still requires Microsoft Edge and WebView2 on Windows. Login is performed manually in the dedicated headed Edge profile. Starting with v0.1.7, the browser is only an authenticated session container after verification. The Worker reads the server bootstrap with HTTP GET, calls sale-property preview with HTTP POST, submits both rebuild phases directly to `/tmall/submit.htm`, and polls the server bootstrap for readback. It does not evaluate page code, mutate `GlobalStore`, emit a submit button event, reload, or navigate the page during a task.
+The app still requires Microsoft Edge and WebView2 on Windows. Login is performed manually in the dedicated headed Edge profile. Starting with v0.1.7, the browser is only an authenticated session container after verification. The Worker reads the server bootstrap with HTTP GET, calls sale-property preview with HTTP POST, submits both rebuild phases directly to `/tmall/submit.htm`, and polls the server bootstrap for readback. It does not evaluate page code, mutate `GlobalStore`, emit a submit button event, reload, or navigate the page during a task. Login opens the seller workbench at `myseller.taobao.com` by default; `TMALL_LOGIN_URL` can override it.
 
 Live execution remains fail-closed. A CAPTCHA/risk page, invalid channel value, local validation error, HTTP/business error, unknown submit response, ID mismatch, or field mismatch moves the task to `needs_manual_review` and is never blindly retried.
 
-Before upgrading, exit the older desktop process so it releases loopback port `19828`. The v0.1.7 UI checks the connected Worker version and disables live mode when an older Worker or an unconfigured contract is still running.
+Before upgrading, exit the older desktop process so it releases loopback port `19828`. The v0.1.8 UI checks the connected Worker version and disables live mode when an older Worker or an unconfigured contract is still running.
 
 ## Verification
 
