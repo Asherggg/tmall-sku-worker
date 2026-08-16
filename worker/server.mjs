@@ -13,7 +13,7 @@ const HOST = process.env.TMALL_WORKER_HOST || "127.0.0.1";
 const DATA_DIR = process.env.TMALL_DATA_DIR || path.join(__dirname, "..", ".runtime", "tmall-worker");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const CONFIRMATION = "确认线上重建";
-const VERSION = "0.1.3";
+const VERSION = "0.1.6";
 const BROWSER_CDP_PORT = Number(process.env.TMALL_BROWSER_CDP_PORT || PORT + 1);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -92,6 +92,9 @@ function addAudit(task, phase, details = {}) {
     method: details.method || "LOCAL",
     path: details.path || "worker://local",
     status: details.status,
+    ...(Number.isFinite(Number(details.durationMs)) ? { durationMs: Number(details.durationMs) } : {}),
+    ...(details.strategy ? { strategy: details.strategy } : {}),
+    ...(details.fastReadbackError ? { fastReadbackError: details.fastReadbackError } : {}),
     businessCode: details.businessCode,
     requestId: details.requestId || requestId(),
     at: now(),
@@ -464,6 +467,18 @@ async function runLiveTask(task) {
       },
       onNetwork(entry) {
         addAudit(task, entry.phase, { method: entry.method, path: entry.path, status: entry.status, businessCode: entry.classification.businessCode });
+        saveState();
+      },
+      onReadback(entry) {
+        addAudit(task, entry.phase, {
+          method: entry.method,
+          path: entry.path,
+          status: entry.status,
+          durationMs: entry.durationMs,
+          strategy: entry.strategy,
+          fastReadbackError: entry.fastReadbackError,
+          businessCode: entry.strategy === "server_bootstrap" ? "SUCCESS" : "FALLBACK",
+        });
         saveState();
       },
     });

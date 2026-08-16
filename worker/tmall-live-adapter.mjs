@@ -3,6 +3,8 @@ import crypto from "node:crypto";
 const PUBLISH_PATH = "/tmall/submit.htm";
 const ASYNC_OPT = "/tmall/asyncOpt.htm";
 const VALID_CHANNEL_OPTIONS = new Set(["1", "2"]);
+const PUBLISH_PAGE_PATH = "/tmall/publish.htm";
+const FAST_READBACK_ENABLED = process.env.TMALL_FAST_READBACK !== "false";
 
 function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -28,6 +30,40 @@ function canonicalize(input) {
   if (Array.isArray(input)) return input.map(canonicalize);
   if (!input || typeof input !== "object") return input;
   return Object.fromEntries(Object.keys(input).sort().map((key) => [key, canonicalize(input[key])]));
+}
+
+function normalizeModelValue(model) {
+  if (model?.value && typeof model.value === "object" && !Array.isArray(model.value)) return model.value;
+  return model;
+}
+
+export function extractServerFormFromHtml(html) {
+  const scripts = String(html || "").match(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi) || [];
+  const script = scripts
+    .map((value) => value.replace(/^<script\b[^>]*>|<\/script\s*>$/gi, ""))
+    .find((value) => /window\.Json\s*=/.test(value));
+  if (!script) throw Object.assign(new Error("服务端发布页缺少 window.Json 模型"), { code: "server_form_model_missing" });
+
+  const assignment = script.match(/window\.Json\s*=\s*/);
+  const start = assignment ? assignment.index + assignment[0].length : -1;
+  const nextModel = start >= 0 ? script.indexOf("window.noIcmpJson", start) : -1;
+  const end = nextModel >= 0 ? script.lastIndexOf(";", nextModel) : -1;
+  if (start < 0 || end <= start) throw Object.assign(new Error("服务端发布页模型边界无法识别"), { code: "server_form_model_invalid" });
+
+  let root;
+  try {
+    root = JSON.parse(script.slice(start, end).trim());
+  } catch (error) {
+    throw Object.assign(new Error("服务端发布页模型不是有效 JSON"), { code: "server_form_json_invalid", cause: error });
+  }
+  const formValues = normalizeModelValue(root?.models?.formValues);
+  if (!formValues || !Array.isArray(formValues.sku)) {
+    throw Object.assign(new Error("服务端发布页模型缺少 SKU 表单"), { code: "server_form_values_missing" });
+  }
+  return {
+    formValues,
+    global: normalizeModelValue(root?.models?.global),
+  };
 }
 
 const TRANSIENT_SKU_FIELDS = new Set([
@@ -95,6 +131,75 @@ function canonicalSalePropKey(value) {
     throw Object.assign(new Error("销售属性预检组合键为空或重复"), { code: "sale_prop_preview_identity_invalid" });
   }
   return pairs.sort().join("_");
+}
+
+function rowSalePropKey(row) {
+  const props = Array.isArray(row?.props) && row.props.length
+    ? row.props
+    : Object.entries(row || {})
+      .filter(([key, value]) => key.startsWith("skuParam_p-") && value && typeof value === "object")
+      .map(([key, value]) => ({ name: key.slice("skuParam_".length), value: value.value, text: value.text }));
+  if (!props.length) return null;
+  try { return canonicalSalePropKeyFromProps(props); } catch { return null; }
+}
+
+function mergeServerProps(fallbackProps, serverProps) {
+  const fallback = Array.isArray(fallbackProps) ? fallbackProps : [];
+  const byIdentity = new Map(fallback.map((prop) => [`${prop?.name}:${String(prop?.value ?? "").replace(/^-/, "")}`, prop]));
+  const source = Array.isArray(serverProps) && serverProps.length ? serverProps : fallback;
+  return source.map((prop) => {
+    const identity = `${prop?.name}:${String(prop?.value ?? "").replace(/^-/, "")}`;
+    return { ...clone(byIdentity.get(identity)), ...clone(prop) };
+  });
+}
+
+function mergeServerSkuRows(fallbackRows, serverRows) {
+  const fallbackByKey = new Map();
+  for (const row of activeRows(fallbackRows)) {
+    const key = rowSalePropKey(row);
+    if (!key || fallbackByKey.has(key)) {
+      throw Object.assign(new Error("服务端回读 SKU 组合无法与页面状态一一匹配"), { code: "server_readback_mapping_failed" });
+    }
+    fallbackByKey.set(key, row);
+  }
+
+  const seen = new Set();
+  const merged = activeRows(serverRows).map((serverRow) => {
+    const key = rowSalePropKey(serverRow);
+    const fallbackRow = key ? fallbackByKey.get(key) : null;
+    if (!key || !fallbackRow || seen.has(key)) {
+      throw Object.assign(new Error("服务端回读 SKU 组合缺失、重复或无法匹配"), { code: "server_readback_mapping_failed" });
+    }
+    seen.add(key);
+    return {
+      ...clone(fallbackRow),
+      ...clone(serverRow),
+      props: mergeServerProps(fallbackRow.props, serverRow.props),
+      salePropKey: key,
+    };
+  });
+  if (seen.size !== fallbackByKey.size) {
+    throw Object.assign(new Error("服务端回读 SKU 数量与页面状态不一致"), { code: "server_readback_count_mismatch" });
+  }
+  return merged;
+}
+
+export function mergeServerForm(fallbackForm, serverForm) {
+  if (!fallbackForm || !serverForm) throw Object.assign(new Error("服务端回读表单为空"), { code: "server_readback_form_missing" });
+  return {
+    ...clone(fallbackForm),
+    ...clone(serverForm),
+    sku: mergeServerSkuRows(fallbackForm.sku, serverForm.sku),
+  };
+}
+
+function mergeServerGlobal(fallbackGlobal, serverGlobal) {
+  const merged = { ...clone(fallbackGlobal || {}), ...clone(serverGlobal || {}) };
+  if (fallbackGlobal?.value || serverGlobal?.value) {
+    merged.value = { ...clone(fallbackGlobal?.value || {}), ...clone(serverGlobal?.value || {}) };
+  }
+  if (!merged.id && merged.value?.id) merged.id = merged.value.id;
+  return merged;
 }
 
 function businessSaleProp(saleProp) {
@@ -377,7 +482,7 @@ async function waitForPageForm(page) {
   throw Object.assign(new Error("Tmall 发布页表单加载超时"), { code: "form_state_timeout" });
 }
 
-async function loadReadback(page, baseUrl, classification) {
+async function waitForSubmitCompletion(page, baseUrl, classification) {
   const successUrl = classification?.payload?.models?.globalMessage?.successUrl || classification?.payload?.globalMessage?.successUrl;
   if (successUrl) {
     const expectedUrl = new URL(successUrl, baseUrl).toString();
@@ -390,8 +495,61 @@ async function loadReadback(page, baseUrl, classification) {
   } else {
     await page.waitForTimeout(700);
   }
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
-  return waitForPageForm(page);
+}
+
+async function fetchServerReadback(page, baseUrl) {
+  const result = await page.evaluate(async (url) => {
+    const response = await fetch(url, { credentials: "include", cache: "no-store" });
+    return { status: response.status, text: await response.text() };
+  }, baseUrl);
+  if (!result || result.status < 200 || result.status >= 300) {
+    throw Object.assign(new Error(`服务端回读 HTTP ${result?.status ?? "unknown"}`), { code: "server_readback_http_error", status: result?.status });
+  }
+  return { ...extractServerFormFromHtml(result.text), status: result.status };
+}
+
+async function loadReadback(page, baseUrl, classification, fallbackState, phase) {
+  const startedAt = Date.now();
+  await waitForSubmitCompletion(page, baseUrl, classification);
+
+  if (FAST_READBACK_ENABLED) {
+    try {
+      const parsed = await fetchServerReadback(page, baseUrl);
+      const formValues = mergeServerForm(fallbackState?.formValues, parsed.formValues);
+      const state = {
+        ready: true,
+        formValues,
+        global: mergeServerGlobal(fallbackState?.global, parsed.global),
+        channelData: fallbackState?.channelData || null,
+        salePropMeta: fallbackState?.salePropMeta || [],
+        readback: {
+          phase,
+          method: "GET",
+          path: PUBLISH_PAGE_PATH,
+          status: parsed.status,
+          durationMs: Date.now() - startedAt,
+          strategy: "server_bootstrap",
+        },
+      };
+      return state;
+    } catch (error) {
+      // A changed HTML contract or incomplete server model falls back to the proven page readback.
+      fallbackState = { ...fallbackState, fastReadbackError: error.code || "server_readback_failed" };
+    }
+  }
+
+  const response = await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
+  const state = await waitForPageForm(page);
+  state.readback = {
+    phase,
+    method: "GET",
+    path: PUBLISH_PAGE_PATH,
+    status: response?.status?.() || 200,
+    durationMs: Date.now() - startedAt,
+    strategy: fallbackState?.fastReadbackError ? "page_reload_fallback" : "page_reload",
+    fastReadbackError: fallbackState?.fastReadbackError,
+  };
+  return state;
 }
 
 async function setPageForm(page, formValues) {
@@ -653,7 +811,8 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   const temporarySubmit = await submitThroughEngine(page);
   await invokeHook("onNetwork", { phase: "temporary_submit", path: PUBLISH_PATH, method: "POST", status: temporarySubmit.status, classification: temporarySubmit.classification });
   if (!temporarySubmit.classification.ok) throw Object.assign(new Error(temporarySubmit.classification.message), { code: temporarySubmit.classification.code, businessCode: temporarySubmit.classification.businessCode });
-  state = await loadReadback(page, baseUrl, temporarySubmit.classification);
+  state = await loadReadback(page, baseUrl, temporarySubmit.classification, temporaryPageState, "temporary_readback");
+  await invokeHook("onReadback", state.readback);
   assertItemIdentity(state, page.url(), task.itemId);
   const temporaryReadback = summarizeForm(state.formValues);
   const oldIds = new Set(originalSummary.oldSkuIds);
@@ -680,7 +839,8 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   const finalSubmit = await submitThroughEngine(page);
   await invokeHook("onNetwork", { phase: "final_submit", path: PUBLISH_PATH, method: "POST", status: finalSubmit.status, classification: finalSubmit.classification });
   if (!finalSubmit.classification.ok) throw Object.assign(new Error(finalSubmit.classification.message), { code: finalSubmit.classification.code, businessCode: finalSubmit.classification.businessCode });
-  state = await loadReadback(page, baseUrl, finalSubmit.classification);
+  state = await loadReadback(page, baseUrl, finalSubmit.classification, finalPageState, "final_readback");
+  await invokeHook("onReadback", state.readback);
   assertItemIdentity(state, page.url(), task.itemId);
   const finalSummary = summarizeForm(state.formValues);
   const finalIds = assertExactUniqueSkuIds(finalSummary, generatedIds.length, "final_id_mismatch");

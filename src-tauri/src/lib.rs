@@ -27,16 +27,29 @@ struct HostStatus {
     app_data_dir: String,
 }
 
+fn bundled_file(app: &tauri::AppHandle, relative: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            candidates.push(parent.join(relative));
+        }
+    }
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join(relative));
+        if let Some(parent) = resource_dir.parent() {
+            candidates.push(parent.join(relative));
+        }
+    }
+    candidates.into_iter().find(|path| path.exists())
+}
+
 fn worker_script(app: &tauri::AppHandle) -> PathBuf {
     if let Ok(path) = std::env::var("TMALL_WORKER_SCRIPT") {
         return PathBuf::from(path);
     }
 
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        let bundled = resource_dir.join("worker").join("server.mjs");
-        if bundled.exists() {
-            return bundled;
-        }
+    if let Some(bundled) = bundled_file(app, "worker/server.mjs") {
+        return bundled;
     }
 
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -50,16 +63,13 @@ fn worker_node(app: &tauri::AppHandle) -> String {
         return path;
     }
 
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        let bundled_name = if cfg!(target_os = "windows") {
-            "runtime/node.exe"
-        } else {
-            "runtime/node"
-        };
-        let bundled = resource_dir.join(bundled_name);
-        if bundled.exists() {
-            return bundled.display().to_string();
-        }
+    let bundled_name = if cfg!(target_os = "windows") {
+        "runtime/node.exe"
+    } else {
+        "runtime/node"
+    };
+    if let Some(bundled) = bundled_file(app, bundled_name) {
+        return bundled.display().to_string();
     }
 
     "node".to_string()
@@ -81,7 +91,8 @@ fn spawn_worker(app: &tauri::AppHandle) -> Result<Child, String> {
 
     let node = worker_node(app);
     let live_enabled = std::env::var("TMALL_LIVE_ENABLED").unwrap_or_else(|_| "true".to_string());
-    let live_contract = std::env::var("TMALL_LIVE_CONTRACT").unwrap_or_else(|_| "tmall-publish-v1".to_string());
+    let live_contract =
+        std::env::var("TMALL_LIVE_CONTRACT").unwrap_or_else(|_| "tmall-publish-v1".to_string());
     let mut command = Command::new(node);
     command
         .arg(script)
@@ -105,13 +116,25 @@ fn spawn_worker(app: &tauri::AppHandle) -> Result<Child, String> {
 }
 
 #[tauri::command]
-fn host_status(app: tauri::AppHandle, state: State<'_, WorkerProcess>) -> Result<HostStatus, String> {
-    let mut worker = state.0.lock().map_err(|_| "Worker lock poisoned".to_string())?;
+fn host_status(
+    app: tauri::AppHandle,
+    state: State<'_, WorkerProcess>,
+) -> Result<HostStatus, String> {
+    let mut worker = state
+        .0
+        .lock()
+        .map_err(|_| "Worker lock poisoned".to_string())?;
     let worker_running = match worker.as_mut() {
-        Some(child) => child.try_wait().map_err(|error| error.to_string())?.is_none(),
+        Some(child) => child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_none(),
         None => false,
     };
-    let app_data = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     Ok(HostStatus {
         worker_running,
         worker_port: 19828,
@@ -121,7 +144,10 @@ fn host_status(app: tauri::AppHandle, state: State<'_, WorkerProcess>) -> Result
 
 #[tauri::command]
 fn restart_worker(app: tauri::AppHandle, state: State<'_, WorkerProcess>) -> Result<(), String> {
-    let mut worker = state.0.lock().map_err(|_| "Worker lock poisoned".to_string())?;
+    let mut worker = state
+        .0
+        .lock()
+        .map_err(|_| "Worker lock poisoned".to_string())?;
     if let Some(mut child) = worker.take() {
         let _ = child.kill();
         let _ = child.wait();

@@ -4,6 +4,8 @@ import {
   classifySubmitResponse,
   compareSkuRows,
   executeTmallRebuild,
+  extractServerFormFromHtml,
+  mergeServerForm,
   normalizeChannelOption,
   summarizeForm,
 } from "../worker/tmall-live-adapter.mjs";
@@ -63,6 +65,12 @@ function makeForm(itemId = ITEM_ID) {
 
 function salePropKey(props) {
   return props.map((prop) => `${String(prop.name).replace(/^p-/, "")}--${String(prop.value).replace(/^-/, "")}`).sort().join("_");
+}
+
+function bootstrapHtml(form) {
+  const global = { value: { id: form.id, catId: "50000001", brand: { brandId: "600001" }, spuApply: "700001" }, id: form.id, globalExtendInfo: "{\"mock\":true}" };
+  const payload = { models: { formValues: form, global } };
+  return `<html><script>window.Json = ${JSON.stringify(payload)}; window.noIcmpJson = {};</script></html>`;
 }
 
 class MockTmallPage {
@@ -138,7 +146,12 @@ class MockTmallPage {
     };
     globalThis.window = { GlobalStore: { engine: this.#engine() } };
     globalThis.document = { cookie: "XSRF-TOKEN=mock-xsrf" };
-    globalThis.fetch = async (_url, init) => this.#previewResponse(init);
+    globalThis.fetch = async (_url, init = {}) => {
+      if (this.options.fastReadbackHtml && !init.method) {
+        return { status: 200, text: async () => typeof this.options.fastReadbackHtml === "function" ? this.options.fastReadbackHtml(this.serverForm) : this.options.fastReadbackHtml };
+      }
+      return this.#previewResponse(init);
+    };
     try {
       return await fn(argument);
     } finally {
@@ -270,6 +283,34 @@ test("submit response accepts only an explicit success signal", () => {
   assert.equal(classifySubmitResponse(200, "{}").code, "submit_response_unknown");
 });
 
+test("server bootstrap parser extracts the form model without evaluating page code", () => {
+  const form = makeForm();
+  const parsed = extractServerFormFromHtml(bootstrapHtml(form));
+  assert.equal(parsed.formValues.id, ITEM_ID);
+  assert.equal(parsed.formValues.sku.length, 2);
+  assert.equal(parsed.global.id, ITEM_ID);
+});
+
+test("server readback merges authoritative fields with runtime-only SKU metadata", () => {
+  const fallback = makeForm();
+  fallback.sku[0].skuPicture = { url: "runtime-only.jpg" };
+  const server = clone(fallback);
+  server.sku = server.sku.map((row, index) => ({
+    skuId: `61258016975${39 + index}`,
+    skuPrice: index === 0 ? "2399.00" : row.skuPrice,
+    skuStock: 0,
+    skuOuterId: row.skuOuterId,
+    skuBarcode: row.skuBarcode,
+    "skuParam_p-5569827": { value: Math.abs(Number(row.props[0].value)), text: row.props[0].text },
+    "skuParam_p-1627207": { value: Math.abs(Number(row.props[1].value)), text: row.props[1].text },
+  }));
+  const merged = mergeServerForm(fallback, server);
+  assert.equal(merged.sku[0].skuId, "6125801697539");
+  assert.equal(merged.sku[0].skuPrice, "2399.00");
+  assert.equal(merged.sku[0].skuPicture.url, "runtime-only.jpg");
+  assert.equal(merged.sku[0].salePropKey, salePropKey(merged.sku[0].props));
+});
+
 test("SKU comparison canonicalizes order and IDs while checking every business field", () => {
   const original = [sku("5757013487113")];
   const rebuilt = [sku("6125801697539", { props: [...original[0].props].reverse(), action: { selected: true, transient: "ignored" } })];
@@ -310,6 +351,28 @@ test("two-phase rebuild matches reversed preview rows by absolute salePropKey an
   assert.equal(temporary.sku.every((row) => !row.salePropKey.includes("---")), true);
   assert.deepEqual(page.submittedForms[1].saleProp, makeForm().saleProp);
   assert.deepEqual(page.submittedForms[1].sku.map((row) => row.skuPicture), makeForm().sku.map((row) => row.skuPicture));
+});
+
+test("two-phase rebuild uses server bootstrap readback without redundant page reloads", async () => {
+  const page = new MockTmallPage(makeForm(), { fastReadbackHtml: (form) => bootstrapHtml(form) });
+  const readbacks = [];
+  const result = await executeTmallRebuild(page, task(), { onReadback(entry) { readbacks.push(entry); } });
+
+  assert.equal(page.submitCount, 2);
+  assert.equal(page.waitForUrlCalls, 2);
+  assert.deepEqual(readbacks.map((entry) => entry.strategy), ["server_bootstrap", "server_bootstrap"]);
+  assert.equal(page.gotoCalls.length, 1);
+  assert.equal(result.comparison.equal, true);
+});
+
+test("malformed server bootstrap readback falls back to full page navigation", async () => {
+  const page = new MockTmallPage(makeForm(), { fastReadbackHtml: "<html><body>changed</body></html>" });
+  const readbacks = [];
+  await executeTmallRebuild(page, task(), { onReadback(entry) { readbacks.push(entry); } });
+
+  assert.deepEqual(readbacks.map((entry) => entry.strategy), ["page_reload_fallback", "page_reload_fallback"]);
+  assert.ok(readbacks.every((entry) => entry.fastReadbackError === "server_form_model_missing"));
+  assert.equal(page.gotoCalls.length, 3);
 });
 
 test("post-write hook failures are recorded and cannot block the restore submit", async () => {

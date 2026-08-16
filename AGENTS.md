@@ -45,6 +45,12 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 For browser changes, verify the dedicated Edge process/profile, CDP connection, login state, risk state, `webdriver`, visibility, and same-tab URL before and after the operation. Never claim a live change without a successful server readback.
 
+## Versioning
+
+- Every distributed update must increment the patch version by exactly `0.0.1` (for example, `0.1.3` -> `0.1.4`). Never distribute changed code under an existing version number.
+- Before packaging, synchronize the version across `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, Worker/UI version constants, and release documentation.
+- Complete the release only after the installer filename and installed Worker `/health` version both match the new version.
+
 ## Git Hygiene
 
 - The repository's primary branch is `main`.
