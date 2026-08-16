@@ -8,7 +8,7 @@ const BASE = import.meta.env.VITE_WORKER_URL || "http://127.0.0.1:19828";
 const demoHealth: WorkerHealth = {
   ready: false,
   mode: "demo",
-  workerVersion: "0.1.6",
+  workerVersion: "0.1.7",
   browser: "unavailable",
   profile: "应用专属 Profile",
   loggedIn: false,

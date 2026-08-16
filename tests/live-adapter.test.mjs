@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildSubmitBody,
   classifySubmitResponse,
   compareSkuRows,
   executeTmallRebuild,
@@ -67,9 +68,42 @@ function salePropKey(props) {
   return props.map((prop) => `${String(prop.name).replace(/^p-/, "")}--${String(prop.value).replace(/^-/, "")}`).sort().join("_");
 }
 
-function bootstrapHtml(form) {
-  const global = { value: { id: form.id, catId: "50000001", brand: { brandId: "600001" }, spuApply: "700001" }, id: form.id, globalExtendInfo: "{\"mock\":true}" };
-  const payload = { models: { formValues: form, global } };
+function defaultSalePropMeta() {
+  return {
+    "p-5569827": {
+      name: "p-5569827", label: "适用床尺寸", uiType: "comboboxSaleProps", required: true,
+      maxCustomItems: 9999, maxLength: 100, dataSource: [{ value: 32005284901, text: "1.5米床" }],
+    },
+    "p-1627207": {
+      name: "p-1627207", label: "颜色分类", uiType: "newColorSelect", required: false,
+      hasCustomProp: true, maxCustomItems: 30, maxLength: 130,
+      checkUrl: "asyncOpt.htm?optType=tmall_new_check_custom_color",
+    },
+  };
+}
+
+function bootstrapHtml(form, salePropMeta = defaultSalePropMeta(), globalItemId = form.id) {
+  const global = {
+    value: {
+      id: globalItemId,
+      catId: "50000001",
+      brand: { brandId: "600001" },
+      spuApply: "700001",
+      gpfRenderTrace: "mock-render-trace",
+      isLightCombine: null,
+      isSetsCombine: null,
+      combineToNormal: null,
+      tmSpuPublishType: null,
+      isUnBondedGift: null,
+      spu_qf_param: null,
+    },
+    id: globalItemId,
+    globalExtendInfo: "{\"mock\":true}",
+  };
+  const payload = {
+    components: { saleProp: { props: { subItems: salePropMeta } } },
+    models: { formValues: form, global },
+  };
   return `<html><script>window.Json = ${JSON.stringify(payload)}; window.noIcmpJson = {};</script></html>`;
 }
 
@@ -79,129 +113,80 @@ class MockTmallPage {
     this.pageForm = clone(form);
     this.options = options;
     this.globalItemId = options.globalItemId || form.id;
-    this.salePropMeta = clone(options.salePropMeta || {
-      "p-5569827": {
-        name: "p-5569827", label: "适用床尺寸", uiType: "comboboxSaleProps", required: true,
-        maxCustomItems: 9999, maxLength: 100, dataSource: [{ value: 32005284901, text: "1.5米床" }],
-      },
-      "p-1627207": {
-        name: "p-1627207", label: "颜色分类", uiType: "newColorSelect", required: false,
-        hasCustomProp: true, maxCustomItems: 30, maxLength: 130,
-        checkUrl: "asyncOpt.htm?optType=tmall_new_check_custom_color",
-      },
-    });
+    this.salePropMeta = clone(options.salePropMeta || defaultSalePropMeta());
     this._url = "about:blank";
-    this.pendingSuccessUrl = null;
     this.submitCount = 0;
+    this.getCount = 0;
+    this.apiCalls = [];
     this.gotoCalls = [];
     this.waitForUrlCalls = 0;
     this.reloadCalls = 0;
-    this.setPageFormCount = 0;
     this.submittedForms = [];
-    this.responseWaiter = null;
   }
 
   isClosed() { return false; }
   url() { return this._url; }
 
+  context() {
+    return {
+      cookies: async () => [{ name: "XSRF-TOKEN", value: "mock-xsrf" }],
+      request: { fetch: (url, init) => this.#apiFetch(url, init) },
+    };
+  }
+
   async goto(url) {
     this.gotoCalls.push(url);
-    this._url = url;
-    this.pendingSuccessUrl = null;
-    this.pageForm = clone(this.serverForm);
+    throw new Error("pure API adapter must not navigate the page");
   }
 
   async reload() {
     this.reloadCalls += 1;
-    throw new Error("adapter must not reload before the success navigation");
+    throw new Error("pure API adapter must not reload the page");
   }
 
   async waitForTimeout() {}
 
-  async waitForURL(predicate) {
+  async waitForURL() {
     this.waitForUrlCalls += 1;
-    if (this.pendingSuccessUrl) {
-      this._url = this.pendingSuccessUrl;
-      this.pendingSuccessUrl = null;
-    }
-    if (!predicate(new URL(this._url))) throw new Error("unexpected navigation target");
+    throw new Error("pure API adapter must not wait for page navigation");
   }
 
-  waitForResponse(predicate) {
-    return new Promise((resolve) => {
-      this.responseWaiter = { predicate, resolve };
-    });
+  waitForResponse() {
+    throw new Error("pure API adapter must not observe page requests");
   }
 
-  async evaluate(fn, argument) {
-    const previous = {
-      window: globalThis.window,
-      document: globalThis.document,
-      fetch: globalThis.fetch,
-    };
-    const had = {
-      window: Object.hasOwn(globalThis, "window"),
-      document: Object.hasOwn(globalThis, "document"),
-      fetch: Object.hasOwn(globalThis, "fetch"),
-    };
-    globalThis.window = { GlobalStore: { engine: this.#engine() } };
-    globalThis.document = { cookie: "XSRF-TOKEN=mock-xsrf" };
-    globalThis.fetch = async (_url, init = {}) => {
-      if (this.options.fastReadbackHtml && !init.method) {
-        return { status: 200, text: async () => typeof this.options.fastReadbackHtml === "function" ? this.options.fastReadbackHtml(this.serverForm) : this.options.fastReadbackHtml };
+  async evaluate() {
+    throw new Error("pure API adapter must not evaluate page code");
+  }
+
+  #response(url, status, body) {
+    return { url: () => url, status: () => status, text: async () => body };
+  }
+
+  async #apiFetch(url, init = {}) {
+    const method = String(init.method || "GET").toUpperCase();
+    this.apiCalls.push({ url, method, headers: clone(init.headers || {}), body: init.data || "" });
+    const parsedUrl = new URL(url);
+    if (method === "GET" && parsedUrl.pathname === "/tmall/publish.htm") {
+      this.getCount += 1;
+      let html = bootstrapHtml(this.serverForm, this.salePropMeta, this.globalItemId);
+      if (this.submitCount > 0 && this.options.fastReadbackHtml) {
+        html = typeof this.options.fastReadbackHtml === "function"
+          ? this.options.fastReadbackHtml(this.serverForm, this.salePropMeta, this.globalItemId)
+          : this.options.fastReadbackHtml;
       }
-      return this.#previewResponse(init);
-    };
-    try {
-      return await fn(argument);
-    } finally {
-      for (const key of Object.keys(previous)) {
-        if (had[key]) globalThis[key] = previous[key];
-        else delete globalThis[key];
-      }
+      return this.#response(url, 200, html);
     }
+    if (method === "POST" && parsedUrl.pathname === "/tmall/asyncOpt.htm") return this.#previewResponse(init, url);
+    if (method === "POST" && parsedUrl.pathname === "/tmall/submit.htm") {
+      const body = new URLSearchParams(init.data);
+      return this.#submit(JSON.parse(body.get("jsonBody")), url);
+    }
+    throw new Error(`unexpected API request: ${method} ${url}`);
   }
 
-  #engine() {
-    return {
-      getModels: (name) => {
-        if (name === "formValues") return this.pageForm;
-        if (name === "global") {
-          return {
-            value: { id: this.globalItemId, catId: "50000001", brand: { brandId: "600001" }, spuApply: "700001" },
-            id: this.globalItemId,
-            globalExtendInfo: "{\"mock\":true}",
-          };
-        }
-        if (name === "formError") return {};
-        return null;
-      },
-      getComponent: (name) => {
-        if (name === "saleProp") {
-          return {
-            getProps: () => ({ value: this.pageForm.saleProp, subItems: this.salePropMeta }),
-            setProps: ({ value }) => { this.pageForm.saleProp = clone(value); },
-          };
-        }
-        if (name === "sku") return { setProps: ({ value }) => { this.pageForm.sku = clone(value); } };
-        if (name === "channelOption") {
-          return {
-            getData: () => ({ props: { value: clone(this.pageForm.channelOption) } }),
-            setProps: ({ value }) => {
-              this.pageForm.channelOption = clone(value);
-              this.setPageFormCount += 1;
-              this.options.afterSetPageForm?.(this.pageForm, this.setPageFormCount);
-            },
-          };
-        }
-        if (name === "button-submit") return { emit: (event) => { if (event === "click") this.#submit(); } };
-        return null;
-      },
-    };
-  }
-
-  #previewResponse(init) {
-    const values = JSON.parse(new URLSearchParams(init.body).get("jsonBody"));
+  #previewResponse(init, url) {
+    const values = JSON.parse(new URLSearchParams(init.data).get("jsonBody"));
     let rows = values.sku.map((row) => ({
       salePropKey: salePropKey(row.props),
       skuId: 0,
@@ -210,36 +195,22 @@ class MockTmallPage {
       skuQuality: { value: "mainSku", text: "单品", prefilled: true },
     })).reverse();
     if (this.options.previewRows) rows = this.options.previewRows(rows, values);
-    return {
-      status: 200,
-      text: async () => JSON.stringify({ success: true, data: { value: rows } }),
-    };
+    return this.#response(url, 200, JSON.stringify({ success: true, data: { value: rows } }));
   }
 
-  #submit() {
+  #submit(submitted, url) {
     this.submitCount += 1;
-    const submitted = clone(this.pageForm);
-    this.submittedForms.push(submitted);
+    this.submittedForms.push(clone(submitted));
     let savedRows = clone(submitted.sku);
     if (this.submitCount === 1) {
       const ids = this.options.temporaryIds || ["6125801697539", "6125801697540"];
       savedRows = savedRows.map((row, index) => ({ ...row, skuId: ids[index] }));
     }
     this.serverForm = { ...clone(submitted), sku: savedRows.reverse() };
-    this.pendingSuccessUrl = `https://sell.publish.tmall.com/tmall/success.htm?id=${ITEM_ID}&phase=${this.submitCount}`;
     const responseBody = JSON.stringify({
-      models: { globalMessage: { type: "success", successUrl: this.pendingSuccessUrl } },
+      models: { globalMessage: { type: "success", successUrl: `https://sell.publish.tmall.com/tmall/success.htm?id=${ITEM_ID}&phase=${this.submitCount}` } },
     });
-    const response = {
-      request: () => ({ method: () => "POST" }),
-      url: () => "https://sell.publish.tmall.com/tmall/submit.htm",
-      status: () => 200,
-      text: async () => responseBody,
-    };
-    const waiter = this.responseWaiter;
-    this.responseWaiter = null;
-    if (!waiter || !waiter.predicate(response)) throw new Error("submit response was not observed");
-    waiter.resolve(response);
+    return this.#response(url, 200, responseBody);
   }
 }
 
@@ -281,6 +252,24 @@ test("submit response rejects HTTP 200 form errors", () => {
 test("submit response accepts only an explicit success signal", () => {
   assert.equal(classifySubmitResponse(200, JSON.stringify({ models: { globalMessage: { type: "success" } } })).ok, true);
   assert.equal(classifySubmitResponse(200, "{}").code, "submit_response_unknown");
+});
+
+test("pure submit contract serializes the observed form fields without page events", () => {
+  const form = makeForm();
+  const global = {
+    id: ITEM_ID,
+    catId: "50000001",
+    gpfRenderTrace: "mock-render-trace",
+    globalExtendInfo: "{\"mock\":true}",
+  };
+  const { body, traceId } = buildSubmitBody(form, global);
+  assert.equal(traceId, "mock-render-trace");
+  assert.deepEqual([...body.keys()], [
+    "isLightCombine", "isSetsCombine", "combineToNormal", "tmSpuPublishType", "isUnBondedGift", "spu_qf_param",
+    "catId", "itemId", "jsonBody", "globalExtendInfo",
+  ]);
+  assert.deepEqual(JSON.parse(body.get("jsonBody")), form);
+  assert.equal(body.get("globalExtendInfo"), "{\"mock\":true}");
 });
 
 test("server bootstrap parser extracts the form model without evaluating page code", () => {
@@ -333,18 +322,27 @@ test("form summary keeps active current and old IDs without request secrets", ()
   assert.equal(JSON.stringify(summary).includes("token"), false);
 });
 
-test("two-phase rebuild matches reversed preview rows by absolute salePropKey and waits for success navigation", async () => {
+test("pure API two-phase rebuild matches reversed preview rows without page navigation", async () => {
   const page = new MockTmallPage();
   const result = await executeTmallRebuild(page, task());
 
   assert.equal(page.submitCount, 2);
-  assert.equal(page.waitForUrlCalls, 2);
+  assert.equal(page.waitForUrlCalls, 0);
   assert.equal(page.reloadCalls, 0);
-  assert.equal(page.gotoCalls.length, 3);
+  assert.equal(page.gotoCalls.length, 0);
+  assert.equal(page.getCount, 3);
   assert.deepEqual([...result.newSkuIds].sort(), ["6125801697539", "6125801697540"]);
   assert.equal(result.comparison.equal, true);
 
+  const submitCalls = page.apiCalls.filter((entry) => new URL(entry.url).pathname === "/tmall/submit.htm");
+  assert.equal(submitCalls.length, 2);
+  assert.ok(submitCalls.every((entry) => entry.headers["X-Requested-With"] === "XMLHttpRequest"));
+  assert.ok(submitCalls.every((entry) => entry.headers["X-XSRF-TOKEN"] === "mock-xsrf"));
+  assert.ok(submitCalls.every((entry) => entry.headers["x-gpf-renderId"] === "mock-render-trace"));
+
   const temporary = page.submittedForms[0];
+  assert.equal(temporary.gpfRenderTrace, "mock-render-trace");
+  assert.equal(temporary.icmp_global.id, ITEM_ID);
   assert.notDeepEqual(temporary.saleProp["p-5569827"], makeForm().saleProp["p-5569827"]);
   assert.deepEqual(temporary.saleProp["p-1627207"], makeForm().saleProp["p-1627207"]);
   assert.equal(temporary.saleProp["p-5569827"].every((value) => value.text.length <= 30), true);
@@ -353,26 +351,25 @@ test("two-phase rebuild matches reversed preview rows by absolute salePropKey an
   assert.deepEqual(page.submittedForms[1].sku.map((row) => row.skuPicture), makeForm().sku.map((row) => row.skuPicture));
 });
 
-test("two-phase rebuild uses server bootstrap readback without redundant page reloads", async () => {
-  const page = new MockTmallPage(makeForm(), { fastReadbackHtml: (form) => bootstrapHtml(form) });
+test("two-phase rebuild uses API server bootstrap readback only", async () => {
+  const page = new MockTmallPage();
   const readbacks = [];
   const result = await executeTmallRebuild(page, task(), { onReadback(entry) { readbacks.push(entry); } });
 
   assert.equal(page.submitCount, 2);
-  assert.equal(page.waitForUrlCalls, 2);
-  assert.deepEqual(readbacks.map((entry) => entry.strategy), ["server_bootstrap", "server_bootstrap"]);
-  assert.equal(page.gotoCalls.length, 1);
+  assert.equal(page.waitForUrlCalls, 0);
+  assert.deepEqual(readbacks.map((entry) => entry.strategy), ["api_server_bootstrap", "api_server_bootstrap"]);
+  assert.ok(readbacks.every((entry) => entry.settled === true && entry.attempts === 1));
+  assert.equal(page.gotoCalls.length, 0);
   assert.equal(result.comparison.equal, true);
 });
 
-test("malformed server bootstrap readback falls back to full page navigation", async () => {
+test("malformed API bootstrap readback fails closed without page fallback", async () => {
   const page = new MockTmallPage(makeForm(), { fastReadbackHtml: "<html><body>changed</body></html>" });
-  const readbacks = [];
-  await executeTmallRebuild(page, task(), { onReadback(entry) { readbacks.push(entry); } });
-
-  assert.deepEqual(readbacks.map((entry) => entry.strategy), ["page_reload_fallback", "page_reload_fallback"]);
-  assert.ok(readbacks.every((entry) => entry.fastReadbackError === "server_form_model_missing"));
-  assert.equal(page.gotoCalls.length, 3);
+  await assert.rejects(executeTmallRebuild(page, task()), (error) => error.code === "server_form_model_missing");
+  assert.equal(page.submitCount, 1);
+  assert.equal(page.gotoCalls.length, 0);
+  assert.equal(page.reloadCalls, 0);
 });
 
 test("post-write hook failures are recorded and cannot block the restore submit", async () => {
@@ -389,34 +386,13 @@ test("post-write hook failures are recorded and cannot block the restore submit"
   assert.deepEqual(result.hookErrors.map((entry) => entry.hook).sort(), ["onSnapshot", "onWriteStart"]);
 });
 
-test("temporary submit is not emitted when component side effects mutate the prepared form", async () => {
-  const writePhases = [];
-  const page = new MockTmallPage(makeForm(), {
-    afterSetPageForm(form, count) {
-      if (count === 1) form.sku[0].skuBarcode = "component-mutated-barcode";
-    },
-  });
-  await assert.rejects(executeTmallRebuild(page, task(), {
-    onWriteStart(entry) { writePhases.push(entry.phase); },
-  }), (error) => error.code === "temporary_prewrite_state_mismatch");
-  assert.equal(page.submitCount, 0);
-  assert.deepEqual(writePhases, []);
-});
-
-test("final submit is not emitted when component side effects swap generated IDs", async () => {
-  const writePhases = [];
-  const page = new MockTmallPage(makeForm(), {
-    afterSetPageForm(form, count) {
-      if (count === 2) {
-        [form.sku[0].skuId, form.sku[1].skuId] = [form.sku[1].skuId, form.sku[0].skuId];
-      }
-    },
-  });
-  await assert.rejects(executeTmallRebuild(page, task(), {
-    onWriteStart(entry) { writePhases.push(entry.phase); },
-  }), (error) => error.code === "final_prewrite_state_mismatch");
-  assert.equal(page.submitCount, 1);
-  assert.deepEqual(writePhases, ["temporary_submit"]);
+test("pure API transport never evaluates, clicks, reloads, or navigates the page", async () => {
+  const page = new MockTmallPage();
+  await executeTmallRebuild(page, task());
+  assert.equal(page.gotoCalls.length, 0);
+  assert.equal(page.reloadCalls, 0);
+  assert.equal(page.waitForUrlCalls, 0);
+  assert.equal(page.apiCalls.filter((entry) => entry.method === "POST").length, 4);
 });
 
 test("pre-write recovery snapshot persistence failure stops before the first request", async () => {

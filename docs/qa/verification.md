@@ -9,9 +9,10 @@
 - Requests from disallowed browser origins are rejected.
 - Concurrent batches serialize and both complete.
 - Live item locks survive Worker restart; a retry runs only the selected task.
-- Both submit phases re-read and validate the page's actual form state before emitting the internal submit event.
-- Successful submit readback prefers the same-origin server bootstrap GET and falls back to full page navigation when parsing or canonical mapping fails.
-- Automated suite: 37/37 passed for v0.1.6.
+- Both submit phases serialize and validate the intended form before direct HTTP submission.
+- Snapshot, preview, both submits, and readback use the authenticated API request context without page evaluation, events, reloads, or navigation.
+- Malformed bootstrap and canonical mapping failures fail closed without a page-operation fallback.
+- Automated suite: 37/37 passed for v0.1.7.
 
 ## Build
 
@@ -36,4 +37,4 @@ Playwright launched the installed Edge channel headlessly, loaded the console, c
 
 ## Deliberate boundary
 
-The v0.1.6 desktop build enables the versioned `tmall-publish-v1` executor and uses the Windows GUI subsystem so the installed application opens without a console window. Unit tests cover channel allowlisting, HTTP-200 business-error classification, unknown-response fail-closed behavior, page-state mutation detection, two-phase navigation/readback, fast server-bootstrap readback with full-navigation fallback, exact ID mapping, item-level write locks, and semantic SKU comparison. Installer verification does not execute a real product write; acceptance still requires one confirmed test item to complete temporary submit/readback, restore/final submit, and final field/ID readback.
+The v0.1.7 source enables the versioned `tmall-publish-v2` pure-HTTP executor. Unit tests cover the direct submit form contract, XSRF/header handling, absence of page evaluation/events/navigation, channel allowlisting, HTTP-200 business-error classification, unknown-response fail-closed behavior, bootstrap-only readback, exact ID mapping, item-level write locks, and semantic SKU comparison. The latest installed-package smoke evidence above remains from v0.1.6; v0.1.7 still requires packaging plus one confirmed test item before release acceptance.

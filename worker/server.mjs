@@ -13,7 +13,7 @@ const HOST = process.env.TMALL_WORKER_HOST || "127.0.0.1";
 const DATA_DIR = process.env.TMALL_DATA_DIR || path.join(__dirname, "..", ".runtime", "tmall-worker");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const CONFIRMATION = "确认线上重建";
-const VERSION = "0.1.6";
+const VERSION = "0.1.7";
 const BROWSER_CDP_PORT = Number(process.env.TMALL_BROWSER_CDP_PORT || PORT + 1);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -144,7 +144,7 @@ function unresolvedLiveWrite(itemId, exceptTaskId) {
 
 function health() {
   const liveEnabled = process.env.TMALL_LIVE_ENABLED === "true";
-  const contractConfigured = process.env.TMALL_LIVE_CONTRACT === "tmall-publish-v1";
+  const contractConfigured = process.env.TMALL_LIVE_CONTRACT === "tmall-publish-v2";
   return {
     ready: true,
     mode: liveEnabled ? "live" : "demo",
@@ -416,7 +416,7 @@ async function runDemoTask(task) {
 }
 
 async function runLiveTask(task) {
-  if (process.env.TMALL_LIVE_ENABLED !== "true" || process.env.TMALL_LIVE_CONTRACT !== "tmall-publish-v1") {
+  if (process.env.TMALL_LIVE_ENABLED !== "true" || process.env.TMALL_LIVE_CONTRACT !== "tmall-publish-v2") {
     task.status = "needs_manual_review";
     task.errorCode = "adapter_contract_missing";
     task.errorMessage = "线上适配器契约未配置，未发出任何写请求";

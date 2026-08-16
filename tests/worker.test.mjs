@@ -299,12 +299,12 @@ test("an unresolved live write survives restart and locks the item", async () =>
     browser: {},
   }, null, 2)}\n`, "utf8");
 
-  let isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, { TMALL_LIVE_ENABLED: "true", TMALL_LIVE_CONTRACT: "tmall-publish-v1" });
+  let isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, { TMALL_LIVE_ENABLED: "true", TMALL_LIVE_CONTRACT: "tmall-publish-v2" });
   try {
     await waitForWorkerAt(isolatedPort);
     assert.equal((await (await fetch(`http://127.0.0.1:${isolatedPort}/health`)).json()).unresolvedLiveWrites, 1);
     await stopWorker(isolatedChild);
-    isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, { TMALL_LIVE_ENABLED: "true", TMALL_LIVE_CONTRACT: "tmall-publish-v1" });
+    isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, { TMALL_LIVE_ENABLED: "true", TMALL_LIVE_CONTRACT: "tmall-publish-v2" });
     await waitForWorkerAt(isolatedPort);
 
     const blockedStart = await fetch(`http://127.0.0.1:${isolatedPort}/batches/waiting_batch/start`, {

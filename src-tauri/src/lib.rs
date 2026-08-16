@@ -92,7 +92,7 @@ fn spawn_worker(app: &tauri::AppHandle) -> Result<Child, String> {
     let node = worker_node(app);
     let live_enabled = std::env::var("TMALL_LIVE_ENABLED").unwrap_or_else(|_| "true".to_string());
     let live_contract =
-        std::env::var("TMALL_LIVE_CONTRACT").unwrap_or_else(|_| "tmall-publish-v1".to_string());
+        std::env::var("TMALL_LIVE_CONTRACT").unwrap_or_else(|_| "tmall-publish-v2".to_string());
     let mut command = Command::new(node);
     command
         .arg(script)

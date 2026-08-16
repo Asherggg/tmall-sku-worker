@@ -23,7 +23,7 @@ Tauri 2
 
 ### Worker
 
-- 源码直接启动默认 `demo`；v0.1.6 Windows 安装版由 Tauri host 显式启用 `tmall-publish-v1`。
+- 源码直接启动默认 `demo`；v0.1.7 Windows 安装版由 Tauri host 显式启用 `tmall-publish-v2`。
 - `live` 必须同时满足环境开关、批次确认词和任务快照校验。
 - 一个 Profile 只有一个 Worker；同一账号同一时间只写一个 `itemId`。
 - 未知提交结果统一进入 `needs_manual_review`，禁止自动重试写请求。
@@ -70,14 +70,16 @@ interface ItemTaskInput {
 
 ## 5. Tmall adapter 边界
 
-- 读取和提交均在页面上下文使用当前登录态。
+- Edge 只提供人工登录后的认证上下文；任务执行使用 Playwright `BrowserContext.request` 共享该上下文的 Cookie，认证字段只存在于内存，不写入任务或审计。
 - 写入流程是：完整表单快照 -> 临时唯一规格提交 -> 回读新 SKU -> 恢复原字段提交 -> 详情回读。
-- 每次提交成功后的回读优先使用同源 `GET /tmall/publish.htm?id=<itemId>` 解析服务端 bootstrap 表单，严格按销售属性组合合并运行时字段；解析、映射或身份校验失败时自动回退完整页面导航回读。
-- 快速回读只优化读取路径，不改变两阶段提交、成功响应判定、字段比对或人工复核门槛；回读审计记录必须包含策略、HTTP 状态和耗时。
+- 商品快照、销售属性元数据和动态提交字段直接从 `GET /tmall/publish.htm?id=<itemId>` 的服务端 bootstrap 解析；不读取或修改 `GlobalStore`。
+- 规格预检直接调用 `POST /tmall/asyncOpt.htm?optType=salePropValueChangeAsync`；两次写入直接调用 `POST /tmall/submit.htm`，使用当次 bootstrap 的完整 `formValues`、`globalExtendInfo` 和渲染跟踪字段。
+- 每次提交后只通过 HTTP GET 轮询服务端 bootstrap，并按临时商家编码或销售属性组合进行一一映射。解析、映射或身份校验失败时直接进入人工复核，不回退页面导航。
+- 回读优化不改变两阶段提交、成功响应判定、字段比对或人工复核门槛；回读审计记录必须包含策略、HTTP 状态、轮询次数和耗时。
 - 内部接口属于 `internal-unstable`；必须保存接口版本、状态码、业务码和回读证据。
-- UI 语义操作只作为接口失效时的人工降级路径，不作为批处理主路径。
-- 页面必须提供 `GlobalStore.engine`、完整 `formValues`、销售属性预检和内部 `button-submit:click` 事件；任一运行时契约缺失时不得执行 live，并返回可解释的错误码。
-- `channelOption` 必须实时读取页面并落在页面当前允许的 `1`/`2` 白名单内，禁止重放历史值。
+- 批处理期间禁止 `page.evaluate`、`GlobalStore.setProps`、`button.emit('click')`、页面刷新和页面导航；UI 操作只保留为人工处理路径。
+- 服务端 bootstrap、完整 `formValues`、销售属性元数据或直接提交字段任一缺失时不得执行 live，并返回可解释的错误码。
+- `channelOption` 必须从当次服务端 bootstrap 读取并落在 `1`/`2` 白名单内，禁止重放历史值。
 
 ## 6. 失败与恢复
 
@@ -87,7 +89,7 @@ interface ItemTaskInput {
 | 读取失败 | 不写入，记录失败 |
 | 临时提交明确失败 | 标记失败，可重新从快照开始 |
 | 提交超时/响应未知 | `needs_manual_review`，禁止盲重试 |
-| 快速回读解析/映射失败 | 自动执行完整页面回退；回退也失败则 `needs_manual_review` |
+| 纯接口回读解析/映射失败 | 有界重试只读 GET；仍失败则 `needs_manual_review`，不操作页面 |
 | 回读字段不一致 | `needs_manual_review`，输出差异 |
 | Worker 崩溃 | 重启后扫描未完成任务，保持人工确认门槛 |
 

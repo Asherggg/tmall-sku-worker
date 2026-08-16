@@ -2,9 +2,11 @@ import crypto from "node:crypto";
 
 const PUBLISH_PATH = "/tmall/submit.htm";
 const ASYNC_OPT = "/tmall/asyncOpt.htm";
+const PUBLISH_ORIGIN = "https://sell.publish.tmall.com";
 const VALID_CHANNEL_OPTIONS = new Set(["1", "2"]);
 const PUBLISH_PAGE_PATH = "/tmall/publish.htm";
-const FAST_READBACK_ENABLED = process.env.TMALL_FAST_READBACK !== "false";
+const READBACK_ATTEMPTS = 6;
+const READBACK_DELAY_MS = 500;
 
 function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -37,6 +39,60 @@ function normalizeModelValue(model) {
   return model;
 }
 
+function normalizeGlobalModel(model) {
+  if (!model || typeof model !== "object") return model;
+  return { ...clone(model.value || {}), ...clone(model) };
+}
+
+function primitive(value) {
+  return typeof value === "string" || typeof value === "number" ? String(value) : "";
+}
+
+function collectDataSourceValueIds(value, output = []) {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectDataSourceValueIds(entry, output);
+  } else if (value && typeof value === "object") {
+    if (typeof value.value === "string" || typeof value.value === "number") output.push(String(value.value));
+    if (value.dataSource) collectDataSourceValueIds(value.dataSource, output);
+    if (value.options) collectDataSourceValueIds(value.options, output);
+    if (value.children) collectDataSourceValueIds(value.children, output);
+  }
+  return output;
+}
+
+function normalizeSalePropMeta(rawSubItems) {
+  const entries = Array.isArray(rawSubItems)
+    ? rawSubItems.map((item) => [primitive(item?.key || item?.name || item?.propName || item?.dataIndex), item])
+    : rawSubItems && typeof rawSubItems === "object" ? Object.entries(rawSubItems) : [];
+  return entries.map(([mapKey, item]) => ({
+    key: primitive(mapKey) || primitive(item?.key || item?.name || item?.propName || item?.dataIndex),
+    label: primitive(item?.label || item?.title),
+    uiType: primitive(item?.uiType || item?.type),
+    required: item?.required === true,
+    hasCustomProp: item?.hasCustomProp === true,
+    isCustomSelectSaleProp: item?.isCustomSelectSaleProp === true,
+    checkUrl: primitive(item?.checkUrl),
+    maxCustomItems: Number.isFinite(Number(item?.maxCustomItems)) ? Number(item.maxCustomItems) : null,
+    maxLength: Number.isFinite(Number(item?.maxLength)) ? Number(item.maxLength) : null,
+    dataSourceValueIds: [...new Set(collectDataSourceValueIds(item?.dataSource))],
+  }));
+}
+
+function hydrateServerSkuProps(formValues) {
+  const next = clone(formValues);
+  next.sku = activeRows(next.sku).map((row) => ({
+    ...row,
+    props: (Array.isArray(row?.props) ? row.props : []).map((prop) => {
+      const candidates = Array.isArray(next.saleProp?.[prop?.name]) ? next.saleProp[prop.name] : [];
+      const valueId = String(prop?.value ?? "").replace(/^-/, "");
+      const match = candidates.find((entry) => String(entry?.value ?? "").replace(/^-/, "") === valueId)
+        || candidates.find((entry) => String(entry?.text ?? "") === String(prop?.text ?? ""));
+      return { ...clone(match || {}), ...clone(prop) };
+    }),
+  }));
+  return next;
+}
+
 export function extractServerFormFromHtml(html) {
   const scripts = String(html || "").match(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi) || [];
   const script = scripts
@@ -56,13 +112,17 @@ export function extractServerFormFromHtml(html) {
   } catch (error) {
     throw Object.assign(new Error("服务端发布页模型不是有效 JSON"), { code: "server_form_json_invalid", cause: error });
   }
-  const formValues = normalizeModelValue(root?.models?.formValues);
+  let formValues = normalizeModelValue(root?.models?.formValues);
+  const global = normalizeGlobalModel(root?.models?.global);
   if (!formValues || !Array.isArray(formValues.sku)) {
     throw Object.assign(new Error("服务端发布页模型缺少 SKU 表单"), { code: "server_form_values_missing" });
   }
+  if ((formValues.id == null || formValues.id === "") && global?.id != null) formValues.id = global.id;
+  formValues = hydrateServerSkuProps(formValues);
   return {
     formValues,
-    global: normalizeModelValue(root?.models?.global),
+    global,
+    salePropMeta: root?.components?.saleProp?.props?.subItems || null,
   };
 }
 
@@ -154,32 +214,45 @@ function mergeServerProps(fallbackProps, serverProps) {
 }
 
 function mergeServerSkuRows(fallbackRows, serverRows) {
+  const fallback = activeRows(fallbackRows);
   const fallbackByKey = new Map();
-  for (const row of activeRows(fallbackRows)) {
+  const outerIdCounts = new Map();
+  for (const row of fallback) {
+    const outerId = String(row?.skuOuterId ?? "");
+    if (outerId) outerIdCounts.set(outerId, (outerIdCounts.get(outerId) || 0) + 1);
+  }
+  const fallbackByOuterId = new Map();
+  for (const [index, row] of fallback.entries()) {
     const key = rowSalePropKey(row);
     if (!key || fallbackByKey.has(key)) {
-      throw Object.assign(new Error("服务端回读 SKU 组合无法与页面状态一一匹配"), { code: "server_readback_mapping_failed" });
+      throw Object.assign(new Error("服务端回读 SKU 组合无法与待提交状态一一匹配"), { code: "server_readback_mapping_failed" });
     }
-    fallbackByKey.set(key, row);
+    fallbackByKey.set(key, index);
+    const outerId = String(row?.skuOuterId ?? "");
+    if (outerId && outerIdCounts.get(outerId) === 1) fallbackByOuterId.set(outerId, index);
   }
 
   const seen = new Set();
   const merged = activeRows(serverRows).map((serverRow) => {
+    const outerId = String(serverRow?.skuOuterId ?? "");
     const key = rowSalePropKey(serverRow);
-    const fallbackRow = key ? fallbackByKey.get(key) : null;
-    if (!key || !fallbackRow || seen.has(key)) {
+    const fallbackIndex = outerId && fallbackByOuterId.has(outerId)
+      ? fallbackByOuterId.get(outerId)
+      : key ? fallbackByKey.get(key) : null;
+    const fallbackRow = fallbackIndex == null ? null : fallback[fallbackIndex];
+    if (!fallbackRow || seen.has(fallbackIndex)) {
       throw Object.assign(new Error("服务端回读 SKU 组合缺失、重复或无法匹配"), { code: "server_readback_mapping_failed" });
     }
-    seen.add(key);
+    seen.add(fallbackIndex);
     return {
       ...clone(fallbackRow),
       ...clone(serverRow),
       props: mergeServerProps(fallbackRow.props, serverRow.props),
-      salePropKey: key,
+      salePropKey: key || rowSalePropKey(fallbackRow),
     };
   });
-  if (seen.size !== fallbackByKey.size) {
-    throw Object.assign(new Error("服务端回读 SKU 数量与页面状态不一致"), { code: "server_readback_count_mismatch" });
+  if (seen.size !== fallback.length) {
+    throw Object.assign(new Error("服务端回读 SKU 数量与待提交状态不一致"), { code: "server_readback_count_mismatch" });
   }
   return merged;
 }
@@ -422,167 +495,109 @@ function buildRestoreForm(original, current, token) {
   return next;
 }
 
-async function readPageForm(page) {
-  const result = await page.evaluate(() => {
-    const engine = window.GlobalStore?.engine;
-    if (!engine || typeof engine.getModels !== "function") return { ready: false };
-    const formValues = engine.getModels("formValues");
-    const globalModel = engine.getModels("global");
-    const channel = engine.getComponent?.("channelOption")?.getData?.();
-    const salePropProps = engine.getComponent?.("saleProp")?.getProps?.();
-    const primitive = (value) => typeof value === "string" || typeof value === "number" ? String(value) : "";
-    const collectDataSourceValueIds = (value, output = []) => {
-      if (Array.isArray(value)) {
-        for (const entry of value) collectDataSourceValueIds(entry, output);
-      } else if (value && typeof value === "object") {
-        if (typeof value.value === "string" || typeof value.value === "number") output.push(String(value.value));
-        if (value.dataSource) collectDataSourceValueIds(value.dataSource, output);
-        if (value.options) collectDataSourceValueIds(value.options, output);
-        if (value.children) collectDataSourceValueIds(value.children, output);
-      }
-      return output;
-    };
-    const rawSubItems = salePropProps?.subItems;
-    const subItemEntries = Array.isArray(rawSubItems)
-      ? rawSubItems.map((item) => [primitive(item?.key || item?.name || item?.propName || item?.dataIndex), item])
-      : rawSubItems && typeof rawSubItems === "object" ? Object.entries(rawSubItems) : [];
-    const salePropMeta = subItemEntries.map(([mapKey, item]) => ({
-      key: primitive(mapKey) || primitive(item?.key || item?.name || item?.propName || item?.dataIndex),
-      label: primitive(item?.label || item?.title),
-      uiType: primitive(item?.uiType || item?.type),
-      required: item?.required === true,
-      hasCustomProp: item?.hasCustomProp === true,
-      isCustomSelectSaleProp: item?.isCustomSelectSaleProp === true,
-      checkUrl: primitive(item?.checkUrl),
-      maxCustomItems: Number.isFinite(Number(item?.maxCustomItems)) ? Number(item.maxCustomItems) : null,
-      maxLength: Number.isFinite(Number(item?.maxLength)) ? Number(item.maxLength) : null,
-      dataSourceValueIds: [...new Set(collectDataSourceValueIds(item?.dataSource))],
-    }));
-    return {
-      ready: true,
-      formValues,
-      global: { ...(globalModel?.value || {}), ...(globalModel || {}) },
-      channelData: channel?.props || null,
-      salePropMeta,
-    };
+function requestContext(page) {
+  const context = page?.context?.();
+  if (!context?.request?.fetch || typeof context.cookies !== "function") {
+    throw Object.assign(new Error("浏览器登录态接口不可用"), { code: "browser_api_context_unavailable" });
+  }
+  return context;
+}
+
+async function apiFetch(page, url, { method = "GET", body = null, headers = {}, timeout = 45_000 } = {}) {
+  const context = requestContext(page);
+  const requestHeaders = {
+    Accept: method === "GET" ? "text/html,application/xhtml+xml" : "application/json, text/plain, */*",
+    Referer: `${PUBLISH_ORIGIN}/`,
+    ...headers,
+  };
+  if (body != null) {
+    requestHeaders["Content-Type"] = "application/x-www-form-urlencoded";
+    requestHeaders["X-Requested-With"] = "XMLHttpRequest";
+    const cookies = await context.cookies(PUBLISH_ORIGIN);
+    const encodedToken = cookies.find((cookie) => cookie.name === "XSRF-TOKEN")?.value || "";
+    let xsrfToken = encodedToken;
+    try { xsrfToken = decodeURIComponent(encodedToken); } catch {}
+    if (xsrfToken) requestHeaders["X-XSRF-TOKEN"] = xsrfToken;
+  }
+  const response = await context.request.fetch(url, {
+    method,
+    headers: requestHeaders,
+    data: body == null ? undefined : body.toString(),
+    timeout,
+    failOnStatusCode: false,
   });
-  if (!result?.ready || !result.formValues) throw Object.assign(new Error("未找到 Tmall 发布页表单状态"), { code: "form_state_unavailable" });
-  return result;
-}
-
-async function waitForPageForm(page) {
-  const deadline = Date.now() + 45_000;
-  while (Date.now() < deadline) {
-    try {
-      const result = await readPageForm(page);
-      if (result.ready && Array.isArray(result.formValues.sku)) return result;
-    } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 300));
-  }
-  throw Object.assign(new Error("Tmall 发布页表单加载超时"), { code: "form_state_timeout" });
-}
-
-async function waitForSubmitCompletion(page, baseUrl, classification) {
-  const successUrl = classification?.payload?.models?.globalMessage?.successUrl || classification?.payload?.globalMessage?.successUrl;
-  if (successUrl) {
-    const expectedUrl = new URL(successUrl, baseUrl).toString();
-    const currentUrl = page.url();
-    if (expectedUrl === baseUrl) {
-      await page.waitForTimeout(700);
-    } else {
-      await page.waitForURL((url) => url.toString() === expectedUrl || url.toString() !== currentUrl, { waitUntil: "domcontentloaded", timeout: 2_500 }).catch(() => page.waitForTimeout(700));
-    }
-  } else {
-    await page.waitForTimeout(700);
-  }
+  return { status: response.status(), text: await response.text(), url: response.url() };
 }
 
 async function fetchServerReadback(page, baseUrl) {
-  const result = await page.evaluate(async (url) => {
-    const response = await fetch(url, { credentials: "include", cache: "no-store" });
-    return { status: response.status, text: await response.text() };
-  }, baseUrl);
-  if (!result || result.status < 200 || result.status >= 300) {
-    throw Object.assign(new Error(`服务端回读 HTTP ${result?.status ?? "unknown"}`), { code: "server_readback_http_error", status: result?.status });
+  const result = await apiFetch(page, baseUrl);
+  if (result.status < 200 || result.status >= 300) {
+    throw Object.assign(new Error(`服务端回读 HTTP ${result.status}`), { code: "server_readback_http_error", status: result.status });
   }
   return { ...extractServerFormFromHtml(result.text), status: result.status };
 }
 
-async function loadReadback(page, baseUrl, classification, fallbackState, phase) {
-  const startedAt = Date.now();
-  await waitForSubmitCompletion(page, baseUrl, classification);
+async function fetchInitialState(page, baseUrl) {
+  const parsed = await fetchServerReadback(page, baseUrl);
+  const globalValues = parsed.global?.value && typeof parsed.global.value === "object" ? clone(parsed.global.value) : {};
+  const formValues = {
+    ...globalValues,
+    ...clone(parsed.formValues),
+    icmp_global: { ...globalValues, ...clone(parsed.formValues?.icmp_global || {}) },
+  };
+  return {
+    ready: true,
+    formValues,
+    global: parsed.global,
+    channelData: null,
+    salePropMeta: normalizeSalePropMeta(parsed.salePropMeta),
+  };
+}
 
-  if (FAST_READBACK_ENABLED) {
+async function loadReadback(page, baseUrl, fallbackState, phase, accepts) {
+  const startedAt = Date.now();
+  let lastState = null;
+  let lastError = null;
+  for (let attempt = 1; attempt <= READBACK_ATTEMPTS; attempt += 1) {
     try {
       const parsed = await fetchServerReadback(page, baseUrl);
-      const formValues = mergeServerForm(fallbackState?.formValues, parsed.formValues);
-      const state = {
+      lastState = {
         ready: true,
-        formValues,
+        formValues: mergeServerForm(fallbackState?.formValues, parsed.formValues),
         global: mergeServerGlobal(fallbackState?.global, parsed.global),
-        channelData: fallbackState?.channelData || null,
-        salePropMeta: fallbackState?.salePropMeta || [],
+        channelData: null,
+        salePropMeta: normalizeSalePropMeta(parsed.salePropMeta) || fallbackState?.salePropMeta || [],
         readback: {
           phase,
           method: "GET",
           path: PUBLISH_PAGE_PATH,
           status: parsed.status,
           durationMs: Date.now() - startedAt,
-          strategy: "server_bootstrap",
+          strategy: "api_server_bootstrap",
+          attempts: attempt,
+          settled: false,
         },
       };
-      return state;
+      if (!accepts || accepts(lastState)) {
+        lastState.readback.settled = true;
+        return lastState;
+      }
     } catch (error) {
-      // A changed HTML contract or incomplete server model falls back to the proven page readback.
-      fallbackState = { ...fallbackState, fastReadbackError: error.code || "server_readback_failed" };
+      lastError = error;
     }
+    if (attempt < READBACK_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, READBACK_DELAY_MS));
   }
-
-  const response = await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
-  const state = await waitForPageForm(page);
-  state.readback = {
-    phase,
-    method: "GET",
-    path: PUBLISH_PAGE_PATH,
-    status: response?.status?.() || 200,
-    durationMs: Date.now() - startedAt,
-    strategy: fallbackState?.fastReadbackError ? "page_reload_fallback" : "page_reload",
-    fastReadbackError: fallbackState?.fastReadbackError,
-  };
-  return state;
-}
-
-async function setPageForm(page, formValues) {
-  const channelOption = normalizeChannelOption(formValues);
-  const result = await page.evaluate(({ formValues: values, channel }) => {
-    const engine = window.GlobalStore?.engine;
-    if (!engine?.getComponent) return { ok: false, reason: "engine_unavailable" };
-    const set = (name, value) => {
-      const component = engine.getComponent(name);
-      if (!component || typeof component.setProps !== "function") throw new Error(`component_missing:${name}`);
-      component.setProps({ value });
-    };
-    set("saleProp", values.saleProp);
-    set("sku", values.sku);
-    set("channelOption", channel);
-    return { ok: true };
-  }, { formValues, channel: channelOption });
-  if (!result?.ok) throw Object.assign(new Error("无法更新 Tmall 页面表单状态"), { code: "form_state_write_unavailable" });
-  await page.waitForTimeout(350);
+  if (lastState) return lastState;
+  throw Object.assign(new Error(`纯接口回读失败: ${lastError?.message || "未知错误"}`), {
+    code: lastError?.code || "server_readback_failed",
+    cause: lastError,
+  });
 }
 
 async function previewSalePropValues(page, formValues, global) {
-  const endpoint = new URL(`${ASYNC_OPT}?optType=salePropValueChangeAsync&catId=${global?.catId || ""}&requiredKey=keyProp&brandId=${global?.brand?.brandId || ""}&itemId=${global?.id || ""}&spuId=${global?.spuApply || ""}`, page.url()).toString();
-  const result = await page.evaluate(async ({ endpoint: url, itemId, formValues: values, globalExtendInfo }) => {
-    const body = new URLSearchParams({ itemId: String(itemId), jsonBody: JSON.stringify(values), globalExtendInfo: globalExtendInfo || "" });
-    const cookie = globalThis.document?.cookie || "";
-    const tokenEntry = cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("XSRF-TOKEN="));
-    const xsrfToken = tokenEntry ? decodeURIComponent(tokenEntry.slice("XSRF-TOKEN=".length)) : "";
-    const headers = { "X-Requested-With": "XMLHttpRequest", "Content-Type": "application/x-www-form-urlencoded" };
-    if (xsrfToken) headers["X-XSRF-TOKEN"] = xsrfToken;
-    const response = await fetch(url, { method: "POST", credentials: "include", headers, body });
-    return { status: response.status, text: await response.text() };
-  }, { endpoint, itemId: global?.id, formValues, globalExtendInfo: global?.globalExtendInfo });
+  const endpoint = new URL(`${ASYNC_OPT}?optType=salePropValueChangeAsync&catId=${global?.catId || ""}&requiredKey=keyProp&brandId=${global?.brand?.brandId || ""}&itemId=${global?.id || ""}&spuId=${global?.spuApply || ""}`, PUBLISH_ORIGIN).toString();
+  const body = new URLSearchParams({ itemId: String(global?.id || ""), jsonBody: JSON.stringify(formValues), globalExtendInfo: global?.globalExtendInfo || "" });
+  const result = await apiFetch(page, endpoint, { method: "POST", body });
   let payload;
   try { payload = JSON.parse(result.text || "{}"); } catch { payload = null; }
   const rows = payload?.data?.value;
@@ -726,22 +741,55 @@ function validateFinalPrewrite(expectedForm, actualForm, generatedIds) {
   }
 }
 
-async function submitThroughEngine(page, timeout = 12_000) {
-  const responsePromise = page.waitForResponse((response) => response.request().method() === "POST" && new URL(response.url()).pathname === PUBLISH_PATH, { timeout }).catch(() => null);
-  const invoke = await page.evaluate(() => {
-    const button = window.GlobalStore?.engine?.getComponent?.("button-submit");
-    if (!button || typeof button.emit !== "function") return { ok: false, reason: "button_submit_event_unavailable" };
-    button.emit("click");
-    return { ok: true, method: "GlobalStore.engine.getComponent('button-submit').emit('click')" };
-  });
-  if (!invoke?.ok) throw Object.assign(new Error("未找到页面内部提交事件，未发出写请求"), { code: invoke?.reason || "submit_event_unavailable" });
-  const response = await responsePromise;
-  if (!response) {
-    const local = await page.evaluate(() => window.GlobalStore?.engine?.getModels?.("formError") || null).catch(() => null);
-    throw Object.assign(new Error(local && Object.keys(local).length ? "页面校验阻止提交，未发出写请求" : "提交事件未产生可确认的写请求"), { code: local && Object.keys(local).length ? "local_validation_error" : "submit_request_missing", formError: local });
+function globalField(global, name) {
+  return global?.[name] ?? global?.value?.[name];
+}
+
+export function buildSubmitBody(formValues, global) {
+  const itemId = globalField(global, "id") ?? formValues?.id;
+  const catId = globalField(global, "catId") ?? formValues?.catId;
+  const traceId = formValues?.gpfRenderTrace || globalField(global, "gpfRenderTrace");
+  if (!itemId || !catId || !traceId) {
+    throw Object.assign(new Error("纯接口提交缺少商品、类目或渲染跟踪字段"), { code: "submit_contract_incomplete" });
   }
-  const text = await response.text();
-  return { response, classification: classifySubmitResponse(response.status(), text), requestPath: PUBLISH_PATH, status: response.status() };
+  const body = new URLSearchParams();
+  for (const name of ["isLightCombine", "isSetsCombine", "combineToNormal", "tmSpuPublishType", "isUnBondedGift", "spu_qf_param"]) {
+    const value = globalField(global, name);
+    body.set(name, value == null ? "null" : String(value));
+  }
+  const optional = {
+    roleType: globalField(global, "roleType"),
+    globalScmExtendInfo: globalField(global, "scmExtendInfo"),
+    globalBizExtendInfo: globalField(global, "bizExtendInfo"),
+  };
+  for (const [name, value] of Object.entries(optional)) {
+    if (value != null && value !== "") body.set(name, typeof value === "string" ? value : JSON.stringify(value));
+  }
+  body.set("catId", String(catId));
+  body.set("itemId", String(itemId));
+  body.set("jsonBody", JSON.stringify(formValues));
+  body.set("globalExtendInfo", String(globalField(global, "globalExtendInfo") ?? globalField(global, "scUrlDataComp") ?? ""));
+  return { body, itemId: String(itemId), traceId: String(traceId) };
+}
+
+async function submitThroughApi(page, formValues, global, baseUrl) {
+  const contract = buildSubmitBody(formValues, global);
+  const endpoint = new URL(PUBLISH_PATH, PUBLISH_ORIGIN).toString();
+  const result = await apiFetch(page, endpoint, {
+    method: "POST",
+    body: contract.body,
+    timeout: 20_000,
+    headers: {
+      Referer: baseUrl,
+      "x-gpf-renderId": contract.traceId,
+      "x-gpf-type": "1",
+    },
+  });
+  return {
+    classification: classifySubmitResponse(result.status, result.text),
+    requestPath: PUBLISH_PATH,
+    status: result.status,
+  };
 }
 
 export async function executeTmallRebuild(page, task, hooks = {}) {
@@ -763,10 +811,8 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   const reportPhase = (phase, message, level, progress) => invokeHook("onPhase", { phase, message, level, progress });
   const baseUrl = `https://sell.publish.tmall.com/tmall/publish.htm?id=${encodeURIComponent(task.itemId)}`;
   if (!page || page.isClosed()) throw Object.assign(new Error("专属 Edge 页面不可用"), { code: "browser_page_unavailable" });
-  // Always reload the canonical URL so an unsaved form left in the tab can never become the recovery snapshot.
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
-  let state = await waitForPageForm(page);
-  assertItemIdentity(state, page.url(), task.itemId);
+  let state = await fetchInitialState(page, baseUrl);
+  assertItemIdentity(state, baseUrl, task.itemId);
   const original = clone(state.formValues);
   const channelOption = normalizeChannelOption(original);
   original.channelOption = channelOption;
@@ -801,21 +847,25 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   const temporaryPreview = await previewSalePropValues(page, temporary.formValues, state.global);
   const temporaryRows = mergePreviewRows(temporary.formValues.sku, temporaryPreview.rows);
   temporary.formValues.sku = temporaryRows;
-  await setPageForm(page, temporary.formValues);
-  const temporaryPageState = await readPageForm(page);
-  assertItemIdentity(temporaryPageState, page.url(), task.itemId);
-  validateTemporaryPrewrite(temporary.formValues, temporaryPageState.formValues, temporary.token);
+  const temporaryState = { ...state, formValues: temporary.formValues };
+  assertItemIdentity(temporaryState, baseUrl, task.itemId);
+  validateTemporaryPrewrite(temporary.formValues, temporary.formValues, temporary.token);
   await reportPhase("temp_submitting", "已生成临时唯一规格，准备提交以获取新 SKU", "warning", 32);
   await invokeHook("onWriteStart", { phase: "temporary_submit" });
   writeAttempted = true;
-  const temporarySubmit = await submitThroughEngine(page);
+  const temporarySubmit = await submitThroughApi(page, temporary.formValues, state.global, baseUrl);
   await invokeHook("onNetwork", { phase: "temporary_submit", path: PUBLISH_PATH, method: "POST", status: temporarySubmit.status, classification: temporarySubmit.classification });
   if (!temporarySubmit.classification.ok) throw Object.assign(new Error(temporarySubmit.classification.message), { code: temporarySubmit.classification.code, businessCode: temporarySubmit.classification.businessCode });
-  state = await loadReadback(page, baseUrl, temporarySubmit.classification, temporaryPageState, "temporary_readback");
-  await invokeHook("onReadback", state.readback);
-  assertItemIdentity(state, page.url(), task.itemId);
-  const temporaryReadback = summarizeForm(state.formValues);
   const oldIds = new Set(originalSummary.oldSkuIds);
+  state = await loadReadback(page, baseUrl, temporaryState, "temporary_readback", (candidate) => {
+    const summary = summarizeForm(candidate.formValues);
+    return summary.skuIds.length === originalSummary.skuCount
+      && new Set(summary.skuIds).size === originalSummary.skuCount
+      && summary.skuIds.every((skuId) => !oldIds.has(skuId));
+  });
+  await invokeHook("onReadback", state.readback);
+  assertItemIdentity(state, baseUrl, task.itemId);
+  const temporaryReadback = summarizeForm(state.formValues);
   const generatedIds = assertExactUniqueSkuIds(temporaryReadback, originalSummary.skuCount, "temporary_readback_mismatch");
   if (generatedIds.some((skuId) => oldIds.has(skuId))) {
     throw Object.assign(new Error("临时提交回读未得到全新的 SKU ID"), { code: "temporary_readback_mismatch", oldSkuIds: [...oldIds], newSkuIds: generatedIds });
@@ -830,18 +880,24 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   const restoreIds = restore.sku.map((row) => positiveSkuId(row.skuId));
   restore.sku = mergePreviewRows(restore.sku, restorePreview.rows).map((row, index) => ({ ...row, skuId: restoreIds[index], skuOldSku: null, sourceSkuId: null }));
   restore.channelOption = channelOption;
-  await setPageForm(page, restore);
-  const finalPageState = await readPageForm(page);
-  assertItemIdentity(finalPageState, page.url(), task.itemId);
-  validateFinalPrewrite(restore, finalPageState.formValues, generatedIds);
+  const finalState = { ...state, formValues: restore };
+  assertItemIdentity(finalState, baseUrl, task.itemId);
+  validateFinalPrewrite(restore, restore, generatedIds);
   await reportPhase("restoring", "正在恢复原规格、价格、库存、商家编码和条码", "info", 72);
   await invokeHook("onWriteStart", { phase: "final_submit" });
-  const finalSubmit = await submitThroughEngine(page);
+  const finalSubmit = await submitThroughApi(page, restore, state.global, baseUrl);
   await invokeHook("onNetwork", { phase: "final_submit", path: PUBLISH_PATH, method: "POST", status: finalSubmit.status, classification: finalSubmit.classification });
   if (!finalSubmit.classification.ok) throw Object.assign(new Error(finalSubmit.classification.message), { code: finalSubmit.classification.code, businessCode: finalSubmit.classification.businessCode });
-  state = await loadReadback(page, baseUrl, finalSubmit.classification, finalPageState, "final_readback");
+  const sortedGeneratedIds = [...generatedIds].sort();
+  state = await loadReadback(page, baseUrl, finalState, "final_readback", (candidate) => {
+    const summary = summarizeForm(candidate.formValues);
+    return JSON.stringify([...summary.skuIds].sort()) === JSON.stringify(sortedGeneratedIds)
+      && compareSkuRows(original.sku, candidate.formValues.sku).equal
+      && compareSaleProps(original.saleProp, candidate.formValues.saleProp)
+      && normalizeChannelOption(candidate.formValues).value === channelOption.value;
+  });
   await invokeHook("onReadback", state.readback);
-  assertItemIdentity(state, page.url(), task.itemId);
+  assertItemIdentity(state, baseUrl, task.itemId);
   const finalSummary = summarizeForm(state.formValues);
   const finalIds = assertExactUniqueSkuIds(finalSummary, generatedIds.length, "final_id_mismatch");
   if (JSON.stringify([...finalIds].sort()) !== JSON.stringify([...generatedIds].sort())) {
