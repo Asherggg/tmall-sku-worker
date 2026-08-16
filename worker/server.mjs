@@ -13,7 +13,7 @@ const HOST = process.env.TMALL_WORKER_HOST || "127.0.0.1";
 const DATA_DIR = process.env.TMALL_DATA_DIR || path.join(__dirname, "..", ".runtime", "tmall-worker");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const CONFIRMATION = "确认线上重建";
-const VERSION = "0.1.8";
+const VERSION = "0.1.9";
 const DEFAULT_LOGIN_URL = "https://myseller.taobao.com/home.htm/QnworkbenchHome/";
 const BROWSER_CDP_PORT = Number(process.env.TMALL_BROWSER_CDP_PORT || PORT + 1);
 
@@ -34,6 +34,7 @@ state.browser = { ...initialState().browser, ...state.browser, profile: initialS
 let activeBatchId = null;
 const pendingRuns = [];
 const scheduledRuns = new Map();
+const runningTaskIds = new Set();
 let browserConnection = null;
 let browserContext = null;
 let browserPage = null;
@@ -71,7 +72,7 @@ function json(response, status, payload, rid) {
     "access-control-allow-origin": corsOrigin,
     "vary": "Origin",
     "access-control-allow-headers": "content-type",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
     "x-request-id": rid || requestId(),
   });
   response.end(`${JSON.stringify(payload)}\n`);
@@ -141,6 +142,44 @@ function unresolvedLiveWrite(itemId, exceptTaskId) {
     && task.id !== exceptTaskId
     && task.liveWriteStarted === true
     && task.status !== "succeeded");
+}
+
+const ACTIVE_TASK_STATUSES = new Set(["reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying"]);
+
+function taskDeletionError(task) {
+  if (runningTaskIds.has(task.id) || ACTIVE_TASK_STATUSES.has(task.status)) {
+    return "任务正在执行，必须等到当前阶段结束后才能删除";
+  }
+  if (task.mode === "live" && task.liveWriteStarted && task.status !== "succeeded") {
+    return "任务已经进入线上写入阶段，只能人工复核，不能删除";
+  }
+  return null;
+}
+
+function removeTaskFromQueues(taskId) {
+  for (const [batchId, taskIds] of scheduledRuns) {
+    taskIds.delete(taskId);
+    if (!taskIds.size) scheduledRuns.delete(batchId);
+  }
+  for (let index = pendingRuns.length - 1; index >= 0; index -= 1) {
+    pendingRuns[index].taskIds = pendingRuns[index].taskIds.filter((idValue) => idValue !== taskId);
+    if (!pendingRuns[index].taskIds.length) pendingRuns.splice(index, 1);
+  }
+}
+
+function updateBatchAfterTaskRemoval(batch) {
+  const batchTasks = state.tasks.filter((task) => task.batchId === batch.id);
+  batch.taskIds = batchTasks.map((task) => task.id);
+  batch.itemCount = batchTasks.length;
+  batch.skuCount = batchTasks.reduce((sum, task) => sum + task.skuIds.length, 0);
+  if (!batchTasks.length) return true;
+  if (batch.status === "running") return false;
+  const statuses = batchTasks.map((task) => task.status);
+  if (statuses.every((status) => status === "succeeded")) batch.status = "succeeded";
+  else if (statuses.some((status) => status === "succeeded")) batch.status = "partial";
+  else if (statuses.some((status) => ["planned", "queued", "paused"].includes(status))) batch.status = "queued";
+  else batch.status = "failed";
+  return false;
 }
 
 function health() {
@@ -503,6 +542,7 @@ async function runLiveTask(task) {
 }
 
 async function runBatch(batch, selectedTaskIds = batch.taskIds) {
+  if (!selectedTaskIds.length) return;
   if (activeBatchId) {
     const pending = pendingRuns.find((entry) => entry.batchId === batch.id);
     if (pending) pending.taskIds = [...new Set([...pending.taskIds, ...selectedTaskIds])];
@@ -538,8 +578,13 @@ async function runBatch(batch, selectedTaskIds = batch.taskIds) {
       task.attempts += 1;
       addTimeline(task, "queued", "已进入单商品写入队列", "info");
       saveState();
-      if (batch.mode === "demo") await runDemoTask(task);
-      else await runLiveTask(task);
+      runningTaskIds.add(task.id);
+      try {
+        if (batch.mode === "demo") await runDemoTask(task);
+        else await runLiveTask(task);
+      } finally {
+        runningTaskIds.delete(task.id);
+      }
     }
     const taskStates = batch.taskIds.map((idValue) => state.tasks.find((task) => task.id === idValue)?.status);
     batch.status = taskStates.every((status) => status === "succeeded") ? "succeeded" : taskStates.some((status) => status === "succeeded") ? "partial" : "failed";
@@ -547,7 +592,7 @@ async function runBatch(batch, selectedTaskIds = batch.taskIds) {
   } finally {
     activeBatchId = null;
     const nextRun = pendingRuns.shift();
-    if (nextRun) {
+    if (nextRun && nextRun.taskIds.length) {
       const nextBatch = state.batches.find((entry) => entry.id === nextRun.batchId);
       if (nextBatch) queueMicrotask(() => runBatch(nextBatch, nextRun.taskIds));
     }
@@ -590,6 +635,24 @@ async function route(request, response) {
     if (request.method === "GET" && /^\/tasks\/[^/]+$/.test(pathname)) {
       const task = state.tasks.find((entry) => entry.id === pathname.split("/")[2]);
       return task ? json(response, 200, taskResponse(task), rid) : json(response, 404, { error: "task_not_found" }, rid);
+    }
+    if (request.method === "DELETE" && /^\/tasks\/[^/]+$/.test(pathname)) {
+      const taskId = pathname.split("/")[2];
+      const task = state.tasks.find((entry) => entry.id === taskId);
+      if (!task) return json(response, 404, { error: "task_not_found" }, rid);
+      const deletionError = taskDeletionError(task);
+      if (deletionError) return json(response, 409, { error: "task_not_deletable", message: deletionError }, rid);
+      const batch = state.batches.find((entry) => entry.id === task.batchId);
+      removeTaskFromQueues(task.id);
+      addAudit(task, "deleted", { method: "DELETE", path: `/tasks/${task.id}`, status: 200, businessCode: "TASK_DELETED" });
+      state.tasks = state.tasks.filter((entry) => entry.id !== task.id);
+      let removedBatch = false;
+      if (batch) {
+        removedBatch = updateBatchAfterTaskRemoval(batch);
+        if (removedBatch) state.batches = state.batches.filter((entry) => entry.id !== batch.id);
+      }
+      saveState();
+      return json(response, 200, { deleted: true, taskId: task.id, batchId: task.batchId, removedBatch }, rid);
     }
     if (request.method === "POST" && pathname === "/tasks") {
       const payload = await body(request);

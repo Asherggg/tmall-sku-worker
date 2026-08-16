@@ -8,7 +8,7 @@ const BASE = import.meta.env.VITE_WORKER_URL || "http://127.0.0.1:19828";
 const demoHealth: WorkerHealth = {
   ready: false,
   mode: "demo",
-  workerVersion: "0.1.8",
+  workerVersion: "0.1.9",
   browser: "unavailable",
   profile: "应用专属 Profile",
   loggedIn: false,
@@ -72,6 +72,10 @@ export async function pauseTask(taskId: string) {
 
 export async function retryTask(taskId: string) {
   return request<{ accepted: boolean }>(`/tasks/${encodeURIComponent(taskId)}/retry`, { method: "POST" });
+}
+
+export async function deleteTask(taskId: string) {
+  return request<{ deleted: boolean; taskId: string; batchId: string; removedBatch: boolean }>(`/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" });
 }
 
 export async function browserAction(action: "login" | "hide" | "verify") {

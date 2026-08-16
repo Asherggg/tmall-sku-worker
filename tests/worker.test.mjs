@@ -134,6 +134,26 @@ test("live tasks cannot be paused after creation", async () => {
   assert.equal((await pause.json()).error, "live_task_not_pausable");
 });
 
+test("tasks can be manually deleted before live writing starts", async () => {
+  const create = await fetch(`http://127.0.0.1:${port}/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode: "live", confirmation: "确认线上重建", items: [{ itemId: "10010", skuIds: [] }] }),
+  });
+  assert.equal(create.status, 201);
+  const { batchId, tasks: createdTasks } = await create.json();
+  const taskId = createdTasks[0].id;
+
+  const deletion = await fetch(`http://127.0.0.1:${port}/tasks/${taskId}`, { method: "DELETE" });
+  assert.equal(deletion.status, 200);
+  assert.deepEqual(await deletion.json(), { deleted: true, taskId, batchId, removedBatch: true });
+  assert.equal((await fetch(`http://127.0.0.1:${port}/tasks/${taskId}`)).status, 404);
+  const batches = await (await fetch(`http://127.0.0.1:${port}/batches`)).json();
+  assert.equal(batches.batches.some((batch) => batch.id === batchId), false);
+  const audit = await (await fetch(`http://127.0.0.1:${port}/audit/export`)).json();
+  assert.equal(audit.records.find((entry) => entry.taskId === taskId)?.businessCode, "TASK_DELETED");
+});
+
 test("invalid item IDs are rejected before queueing", async () => {
   const response = await fetch(`http://127.0.0.1:${port}/tasks`, {
     method: "POST",

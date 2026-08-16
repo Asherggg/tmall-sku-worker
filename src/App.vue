@@ -17,12 +17,14 @@ import {
   RefreshCw,
   RotateCcw,
   ShieldCheck,
+  Trash2,
   Upload,
   UserRound,
 } from "@lucide/vue";
 import {
   browserAction,
   createBatch,
+  deleteTask,
   exportAudit,
   getBatches,
   getHealth,
@@ -35,7 +37,7 @@ import {
 import type { BatchRecord, ImportPreview, TaskRecord, WorkerHealth } from "./types";
 
 type View = "overview" | "import" | "queue" | "browser" | "audit";
-const EXPECTED_WORKER_VERSION = "0.1.8";
+const EXPECTED_WORKER_VERSION = "0.1.9";
 
 const view = ref<View>("overview");
 const health = ref<WorkerHealth>({ ready: false, mode: "demo", workerVersion: "-", browser: "unavailable", profile: "-", loggedIn: false, contract: "demo" });
@@ -57,7 +59,7 @@ const liveRuntimeReady = computed(() => health.value.ready
   && health.value.contract === "configured");
 const liveRuntimeMessage = computed(() => {
   if (!health.value.ready) return "Worker 未启动，不能执行线上任务";
-  if (health.value.workerVersion !== EXPECTED_WORKER_VERSION) return `当前连接的是旧 Worker ${health.value.workerVersion}，请退出旧版后重新打开 0.1.8`;
+  if (health.value.workerVersion !== EXPECTED_WORKER_VERSION) return `当前连接的是旧 Worker ${health.value.workerVersion}，请退出旧版后重新打开 0.1.9`;
   if (health.value.mode !== "live" || health.value.contract !== "configured") return "当前 Worker 未启用 tmall-publish-v2 纯接口适配器";
   return "";
 });
@@ -153,6 +155,35 @@ async function handleRetry(task: TaskRecord) {
     await refresh();
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : "重试失败");
+  }
+}
+
+function canDeleteTask(task: TaskRecord) {
+  if (["reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying"].includes(task.status)) return false;
+  return !(task.mode === "live" && task.liveWriteStarted && task.status !== "succeeded");
+}
+
+async function handleDelete(task: TaskRecord) {
+  if (!canDeleteTask(task)) {
+    ElMessage.warning("任务正在执行或已进入线上写入阶段，不能删除");
+    return;
+  }
+  try {
+    await ElMessageBox.confirm(`删除商品 ${task.itemId} 的任务？删除后会从任务队列移除，但审计记录仍会保留。`, "删除任务", {
+      type: "warning",
+      confirmButtonText: "删除",
+      cancelButtonText: "取消",
+    });
+    await deleteTask(task.id);
+    if (selectedTask.value?.id === task.id) {
+      selectedTask.value = null;
+      drawerOpen.value = false;
+    }
+    ElMessage.success("任务已删除");
+    await refresh();
+  } catch (error) {
+    if (error === "cancel" || error === "close") return;
+    ElMessage.error(error instanceof Error ? error.message : "删除任务失败");
   }
 }
 
@@ -308,7 +339,7 @@ onUnmounted(() => {
             <el-table-column label="状态" width="150"><template #default="scope"><el-tag size="small" :type="statusType(scope.row.status)">{{ statusLabel(scope.row.status) }}</el-tag></template></el-table-column>
             <el-table-column label="阶段"><template #default="scope"><span>{{ scope.row.phaseLabel }}</span><small v-if="scope.row.errorMessage" class="error-line">{{ scope.row.errorMessage }}</small></template></el-table-column>
             <el-table-column label="进度" width="170"><template #default="scope"><el-progress :percentage="scope.row.progress" :status="scope.row.status === 'succeeded' ? 'success' : undefined" :stroke-width="6" /></template></el-table-column>
-            <el-table-column label="操作" width="170"><template #default="scope"><div class="row-actions"><button v-if="scope.row.mode === 'demo' && runningTasks.includes(scope.row)" class="table-icon" title="暂停" @click.stop="handlePause(scope.row)"><Pause :size="15" /></button><button v-if="['failed','needs_manual_review'].includes(scope.row.status) && !(scope.row.mode === 'live' && scope.row.liveWriteStarted)" class="table-icon" title="重试" @click.stop="handleRetry(scope.row)"><RotateCcw :size="15" /></button><el-tag v-if="scope.row.mode === 'live' && scope.row.liveWriteStarted && scope.row.status === 'needs_manual_review'" type="danger" size="small">仅人工复核</el-tag><button class="table-icon" title="查看详情" @click.stop="openTask(scope.row)"><ArrowDownToLine :size="15" /></button></div></template></el-table-column>
+            <el-table-column label="操作" width="220"><template #default="scope"><div class="row-actions"><button v-if="scope.row.mode === 'demo' && runningTasks.includes(scope.row)" class="table-icon" title="暂停" @click.stop="handlePause(scope.row)"><Pause :size="15" /></button><button v-if="['failed','needs_manual_review'].includes(scope.row.status) && !(scope.row.mode === 'live' && scope.row.liveWriteStarted)" class="table-icon" title="重试" @click.stop="handleRetry(scope.row)"><RotateCcw :size="15" /></button><el-tag v-if="scope.row.mode === 'live' && scope.row.liveWriteStarted && scope.row.status === 'needs_manual_review'" type="danger" size="small">仅人工复核</el-tag><button v-if="canDeleteTask(scope.row)" class="table-icon delete-task-button" title="删除任务" @click.stop="handleDelete(scope.row)"><Trash2 :size="15" /></button><button class="table-icon" title="查看详情" @click.stop="openTask(scope.row)"><ArrowDownToLine :size="15" /></button></div></template></el-table-column>
           </el-table>
         </div>
       </section>
@@ -331,6 +362,7 @@ onUnmounted(() => {
         <div class="drawer-summary"><span class="eyebrow">ITEM TASK</span><strong class="mono">{{ selectedTask.itemId }}</strong><el-tag :type="statusType(selectedTask.status)">{{ statusLabel(selectedTask.status) }}</el-tag></div>
         <div class="drawer-grid"><div><span>模式</span><strong>{{ selectedTask.mode === 'demo' ? '演练' : '线上' }}</strong></div><div><span>进度</span><strong>{{ selectedTask.progress }}%</strong></div><div><span>原 SKU</span><strong>{{ skuCountLabel(selectedTask) }}</strong></div><div><span>新 SKU</span><strong>{{ selectedTask.newSkuIds?.length || '—' }}</strong></div></div>
         <div class="timeline"><div v-for="entry in selectedTask.timeline" :key="entry.at + entry.phase" class="timeline-entry"><i :class="['timeline-dot', entry.level]" /><div><small>{{ formatTime(entry.at) }} · {{ entry.phase }}</small><p>{{ entry.message }}</p></div></div><div v-if="!selectedTask.timeline.length" class="empty-copy">尚无阶段记录</div></div>
+        <button v-if="canDeleteTask(selectedTask)" class="ghost-button delete-drawer-button" @click="handleDelete(selectedTask)"><Trash2 :size="15" />删除任务</button>
       </template>
     </el-drawer>
   </div>

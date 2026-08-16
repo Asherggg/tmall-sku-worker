@@ -50,6 +50,8 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .connection-state { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .icon-button, .table-icon { display: inline-grid; place-items: center; width: 32px; height: 32px; border: 1px solid var(--line); border-radius: 6px; color: #51616a; background: var(--surface); }
 .icon-button:hover, .table-icon:hover { border-color: #a7c9c5; color: var(--teal); background: #f4fbfa; }
+.delete-task-button { color: var(--danger); }
+.delete-task-button:hover { border-color: #e7b8b4; color: var(--danger); background: var(--danger-soft); }
 .spinning { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .content-view { padding: 30px 42px 52px; max-width: 1500px; margin: 0 auto; }
@@ -138,6 +140,8 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .drawer-grid div { display: grid; gap: 6px; padding: 12px; background: var(--surface-soft); }
 .drawer-grid span { color: var(--muted); font-size: 11px; }
 .drawer-grid strong { font-size: 14px; }
+.delete-drawer-button { margin-top: 18px; color: var(--danger); }
+.delete-drawer-button:hover { color: var(--danger); background: var(--danger-soft); }
 .timeline { display: grid; gap: 18px; padding: 10px 3px; }
 .timeline-entry { display: flex; gap: 11px; }
 .timeline-dot { width: 9px; height: 9px; margin-top: 4px; border-radius: 50%; background: #9ba9ad; box-shadow: 0 0 0 3px #edf1f2; }
