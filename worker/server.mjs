@@ -14,7 +14,7 @@ const DATA_DIR = process.env.TMALL_DATA_DIR || path.join(__dirname, "..", ".runt
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const CONFIRMATION = "确认线上重建";
 const MANUAL_REVIEW_CONFIRMATION = "确认已人工核对";
-const VERSION = "0.1.12";
+const VERSION = "0.1.13";
 const DEFAULT_LOGIN_URL = "https://myseller.taobao.com/home.htm/QnworkbenchHome/";
 const BROWSER_CDP_PORT = Number(process.env.TMALL_BROWSER_CDP_PORT || PORT + 1);
 
@@ -531,7 +531,7 @@ async function runLiveTask(task) {
     task.progress = 100;
     task.errorCode = undefined;
     task.errorMessage = undefined;
-    addTimeline(task, "final_verified", `线上重建完成：${result.skuCount} 个 SKU 已生成新 ID，字段回读一致`, "success");
+    addTimeline(task, "final_verified", `线上重建完成：${result.skuCount} 个 SKU 已生成新 ID，业务字段回读一致（库存采用平台实时值）`, "success");
     addAudit(task, "final_verified", { method: "GET", path: "/tmall/publish.htm", status: 200, businessCode: "SUCCESS" });
     saveState();
   } catch (error) {

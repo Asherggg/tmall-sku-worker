@@ -37,7 +37,7 @@ import {
 import type { BatchRecord, ImportPreview, TaskRecord, WorkerHealth } from "./types";
 
 type View = "overview" | "import" | "queue" | "browser" | "audit";
-const EXPECTED_WORKER_VERSION = "0.1.12";
+const EXPECTED_WORKER_VERSION = "0.1.13";
 const LIVE_CONFIRMATION = "确认线上重建";
 const PREVIEW_ITEM_LIMIT = 10;
 
@@ -61,7 +61,7 @@ const liveRuntimeReady = computed(() => health.value.ready
   && health.value.contract === "configured");
 const liveRuntimeMessage = computed(() => {
   if (!health.value.ready) return "Worker 未启动，不能执行线上任务";
-  if (health.value.workerVersion !== EXPECTED_WORKER_VERSION) return `当前连接的是旧 Worker ${health.value.workerVersion}，请退出旧版后重新打开 0.1.12`;
+  if (health.value.workerVersion !== EXPECTED_WORKER_VERSION) return `当前连接的是旧 Worker ${health.value.workerVersion}，请退出旧版后重新打开 0.1.13`;
   if (health.value.mode !== "live" || health.value.contract !== "configured") return "当前 Worker 未启用 tmall-publish-v2 纯接口适配器";
   return "";
 });

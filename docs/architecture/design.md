@@ -23,7 +23,8 @@ Tauri 2
 
 ### Worker
 
-- 源码直接启动默认 `demo`；v0.1.12 Windows 安装版由 Tauri host 显式启用 `tmall-publish-v2`，桌面 UI 只提供线上模式，批次预览列表在固定高度区域内滚动。
+- 源码直接启动默认 `demo`；v0.1.13 Windows 安装版由 Tauri host 显式启用 `tmall-publish-v2`，桌面 UI 只提供线上模式，批次预览列表在固定高度区域内滚动。
+- SKU 最终一致性校验覆盖规格、价格、商家编码、条码和其他业务字段，但不比较 `skuStock`；库存由天猫库存系统实时维护，重建期间的库存变化不再阻断任务成功。
 - `live` 必须同时满足环境开关、批次确认词和任务快照校验。
 - 一个 Profile 只有一个 Worker；同一账号同一时间只写一个 `itemId`。
 - 未知提交结果统一进入 `needs_manual_review`，禁止自动重试写请求。

@@ -139,10 +139,10 @@ const TRANSIENT_SKU_FIELDS = new Set([
   "suggestionInfo",
 ]);
 
-function businessSkuRow(row) {
+function businessSkuRow(row, { ignoreStock = false } = {}) {
   const result = {};
   for (const [key, value] of Object.entries(row || {})) {
-    if (TRANSIENT_SKU_FIELDS.has(key) || key.startsWith("skuParam_p-")) continue;
+    if (TRANSIENT_SKU_FIELDS.has(key) || key.startsWith("skuParam_p-") || (ignoreStock && key === "skuStock")) continue;
     result[key] = clone(value);
   }
   result.disabled = row?.disabled === true;
@@ -362,12 +362,13 @@ export function classifySubmitResponse(status, bodyText) {
   return { ok: false, code: "submit_response_unknown", businessCode: "UNKNOWN_RESPONSE", message: "提交响应无法确认成功，已停止自动流程", payload };
 }
 
-export function compareSkuRows(expectedRows, actualRows) {
-  const expected = activeRows(expectedRows).map((row) => JSON.stringify(businessSkuRow(row))).sort();
-  const actual = activeRows(actualRows).map((row) => JSON.stringify(businessSkuRow(row))).sort();
-  if (expected.length !== actual.length) return { equal: false, reason: `SKU 数量 ${actual.length} != ${expected.length}` };
-  if (JSON.stringify(expected) !== JSON.stringify(actual)) return { equal: false, reason: "SKU 业务字段与原快照不一致" };
-  return { equal: true, reason: "SKU 字段一致" };
+export function compareSkuRows(expectedRows, actualRows, { ignoreStock = false } = {}) {
+  const expected = activeRows(expectedRows).map((row) => JSON.stringify(businessSkuRow(row, { ignoreStock }))).sort();
+  const actual = activeRows(actualRows).map((row) => JSON.stringify(businessSkuRow(row, { ignoreStock }))).sort();
+  const ignoredFields = ignoreStock ? ["skuStock"] : [];
+  if (expected.length !== actual.length) return { equal: false, reason: `SKU 数量 ${actual.length} != ${expected.length}`, ignoredFields };
+  if (JSON.stringify(expected) !== JSON.stringify(actual)) return { equal: false, reason: "SKU 业务字段与原快照不一致", ignoredFields };
+  return { equal: true, reason: ignoreStock ? "SKU 字段一致（库存采用平台实时值）" : "SKU 字段一致", ignoredFields };
 }
 
 export function summarizeForm(formValues) {
@@ -892,7 +893,7 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   state = await loadReadback(page, baseUrl, finalState, "final_readback", (candidate) => {
     const summary = summarizeForm(candidate.formValues);
     return JSON.stringify([...summary.skuIds].sort()) === JSON.stringify(sortedGeneratedIds)
-      && compareSkuRows(original.sku, candidate.formValues.sku).equal
+      && compareSkuRows(original.sku, candidate.formValues.sku, { ignoreStock: true }).equal
       && compareSaleProps(original.saleProp, candidate.formValues.saleProp)
       && normalizeChannelOption(candidate.formValues).value === channelOption.value;
   });
@@ -903,7 +904,7 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   if (JSON.stringify([...finalIds].sort()) !== JSON.stringify([...generatedIds].sort())) {
     throw Object.assign(new Error("最终回读 SKU ID 发生变化"), { code: "final_id_mismatch", expected: generatedIds, actual: finalIds });
   }
-  const comparison = compareSkuRows(original.sku, state.formValues.sku);
+  const comparison = compareSkuRows(original.sku, state.formValues.sku, { ignoreStock: true });
   if (!comparison.equal) throw Object.assign(new Error(`最终回读字段不一致：${comparison.reason}`), { code: "final_field_mismatch", reason: comparison.reason });
   if (!compareSaleProps(original.saleProp, state.formValues.saleProp)) {
     throw Object.assign(new Error("最终回读销售属性与原快照不一致"), { code: "final_field_mismatch", reason: "saleProp_mismatch" });
@@ -912,6 +913,6 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
     throw Object.assign(new Error("最终回读销售渠道与原快照不一致"), { code: "final_field_mismatch", reason: "channel_option_mismatch" });
   }
   await invokeHook("onSnapshot", { phase: "after", summary: finalSummary, comparison });
-  await reportPhase("final_verifying", "最终回读一致：原规格字段已恢复且 SKU ID 已更新", "success", 100);
+  await reportPhase("final_verifying", "最终回读一致：原规格字段已恢复且 SKU ID 已更新（库存采用平台实时值）", "success", 100);
   return { oldSkuIds: originalSummary.skuIds, newSkuIds: finalIds, skuCount: finalSummary.skuCount, comparison, hookErrors };
 }

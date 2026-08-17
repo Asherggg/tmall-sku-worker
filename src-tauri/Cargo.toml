@@ -1,6 +1,6 @@
 [package]
 name = "tmall-sku-worker"
-version = "0.1.12"
+version = "0.1.13"
 description = "Local Tmall SKU rebuild desktop worker"
 authors = ["Local Operations"]
 edition = "2021"

@@ -205,6 +205,10 @@ class MockTmallPage {
     if (this.submitCount === 1) {
       const ids = this.options.temporaryIds || ["6125801697539", "6125801697540"];
       savedRows = savedRows.map((row, index) => ({ ...row, skuId: ids[index] }));
+    } else if (this.options.finalStockDelta) {
+      savedRows = savedRows.map((row, index) => index === 0
+        ? { ...row, skuStock: Number(row.skuStock) + Number(this.options.finalStockDelta) }
+        : row);
     }
     this.serverForm = { ...clone(submitted), sku: savedRows.reverse() };
     const responseBody = JSON.stringify({
@@ -307,6 +311,10 @@ test("SKU comparison canonicalizes order and IDs while checking every business f
   assert.equal(compareSkuRows(original, [sku("6125801697539", { skuHolding: "21" })]).equal, false);
   assert.equal(compareSkuRows(original, [sku("6125801697539", { skuPicture: { url: "changed.jpg" } })]).equal, false);
   assert.equal(compareSkuRows(original, [sku("6125801697539", { props: original[0].props.map((prop, index) => index ? { ...prop, value: "-999" } : prop) })]).equal, false);
+  assert.equal(compareSkuRows(original, [sku("6125801697539", { skuStock: 1 })]).equal, false);
+  const inventoryAgnostic = compareSkuRows(original, [sku("6125801697539", { skuStock: 1 })], { ignoreStock: true });
+  assert.equal(inventoryAgnostic.equal, true);
+  assert.deepEqual(inventoryAgnostic.ignoredFields, ["skuStock"]);
 });
 
 test("form summary keeps active current and old IDs without request secrets", () => {
@@ -362,6 +370,16 @@ test("two-phase rebuild uses API server bootstrap readback only", async () => {
   assert.ok(readbacks.every((entry) => entry.settled === true && entry.attempts === 1));
   assert.equal(page.gotoCalls.length, 0);
   assert.equal(result.comparison.equal, true);
+});
+
+test("final verification accepts platform inventory drift while retaining all other field checks", async () => {
+  const page = new MockTmallPage(makeForm(), { finalStockDelta: 1 });
+  const result = await executeTmallRebuild(page, task());
+
+  assert.equal(page.submitCount, 2);
+  assert.equal(result.comparison.equal, true);
+  assert.deepEqual(result.comparison.ignoredFields, ["skuStock"]);
+  assert.equal(page.serverForm.sku.some((row, index) => Number(row.skuStock) !== Number(makeForm().sku[index]?.skuStock)), true);
 });
 
 test("malformed API bootstrap readback fails closed without page fallback", async () => {
