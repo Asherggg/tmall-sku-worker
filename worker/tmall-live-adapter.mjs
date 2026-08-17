@@ -5,8 +5,10 @@ const ASYNC_OPT = "/tmall/asyncOpt.htm";
 const PUBLISH_ORIGIN = "https://sell.publish.tmall.com";
 const VALID_CHANNEL_OPTIONS = new Set(["1", "2"]);
 const PUBLISH_PAGE_PATH = "/tmall/publish.htm";
-const READBACK_ATTEMPTS = 6;
+const TEMP_READBACK_ATTEMPTS = 6;
+const FINAL_READBACK_ATTEMPTS = 12;
 const READBACK_DELAY_MS = 500;
+const FINAL_READBACK_GRACE_MS = 5_000;
 
 function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -72,10 +74,48 @@ function normalizeSalePropMeta(rawSubItems) {
     hasCustomProp: item?.hasCustomProp === true,
     isCustomSelectSaleProp: item?.isCustomSelectSaleProp === true,
     checkUrl: primitive(item?.checkUrl),
+    propertyId: primitive(item?.propertyId) || primitive(mapKey).replace(/^p-/, ""),
     maxCustomItems: Number.isFinite(Number(item?.maxCustomItems)) ? Number(item.maxCustomItems) : null,
     maxLength: Number.isFinite(Number(item?.maxLength)) ? Number(item.maxLength) : null,
     dataSourceValueIds: [...new Set(collectDataSourceValueIds(item?.dataSource))],
   }));
+}
+
+function skuParamEntries(row) {
+  return Object.entries(row || {}).filter(([key]) => /^skuParam_p-\d+$/.test(key));
+}
+
+function normalizedSkuParams(row) {
+  return canonicalize(Object.fromEntries(skuParamEntries(row).map(([key, value]) => {
+    const normalized = clone(value);
+    if (normalized && typeof normalized === "object" && Object.hasOwn(normalized, "value")) {
+      normalized.value = String(normalized.value ?? "");
+    }
+    return [key, normalized];
+  })));
+}
+
+function rowDetailIdentity(row) {
+  const salePropKey = rowSalePropKey(row);
+  if (!salePropKey) return null;
+  return `${salePropKey}|${JSON.stringify(normalizedSkuParams(row))}`;
+}
+
+export function detectPublishVariant(formValues, salePropMeta = []) {
+  const rows = activeRows(formValues?.sku);
+  const baseKeys = rows.map(rowSalePropKey).filter(Boolean);
+  const hasSkuParams = rows.some((row) => skuParamEntries(row).length > 0);
+  const hasDuplicateSalePropKeys = new Set(baseKeys).size !== baseKeys.length;
+  const checkKeys = (Array.isArray(salePropMeta) ? salePropMeta : [])
+    .filter((meta) => meta?.checkUrl && Array.isArray(formValues?.saleProp?.[meta.key]))
+    .map((meta) => meta.key)
+    .sort();
+  return {
+    kind: hasSkuParams || hasDuplicateSalePropKeys ? "sku_detail" : "standard_sku",
+    hasSkuParams,
+    hasDuplicateSalePropKeys,
+    customCheckKeys: checkKeys,
+  };
 }
 
 function hydrateServerSkuProps(formValues) {
@@ -145,6 +185,7 @@ function businessSkuRow(row, { ignoreStock = false } = {}) {
     if (TRANSIENT_SKU_FIELDS.has(key) || key.startsWith("skuParam_p-") || (ignoreStock && key === "skuStock")) continue;
     result[key] = clone(value);
   }
+  result.skuParams = normalizedSkuParams(row);
   result.disabled = row?.disabled === true;
   result.props = (Array.isArray(row?.props) ? row.props : []).map((prop) => ({
     name: String(prop?.name ?? ""),
@@ -216,6 +257,8 @@ function mergeServerProps(fallbackProps, serverProps) {
 function mergeServerSkuRows(fallbackRows, serverRows) {
   const fallback = activeRows(fallbackRows);
   const fallbackByKey = new Map();
+  const fallbackByDetail = new Map();
+  const keyCounts = new Map();
   const outerIdCounts = new Map();
   for (const row of fallback) {
     const outerId = String(row?.skuOuterId ?? "");
@@ -224,32 +267,49 @@ function mergeServerSkuRows(fallbackRows, serverRows) {
   const fallbackByOuterId = new Map();
   for (const [index, row] of fallback.entries()) {
     const key = rowSalePropKey(row);
-    if (!key || fallbackByKey.has(key)) {
-      throw Object.assign(new Error("服务端回读 SKU 组合无法与待提交状态一一匹配"), { code: "server_readback_mapping_failed" });
+    if (!key) throw Object.assign(new Error("服务端回读 SKU 组合无法与待提交状态一一匹配"), { code: "server_readback_mapping_failed" });
+    keyCounts.set(key, (keyCounts.get(key) || 0) + 1);
+    const detailIdentity = rowDetailIdentity(row);
+    if (!detailIdentity || fallbackByDetail.has(detailIdentity)) {
+      throw Object.assign(new Error("服务端回读 SKU 明细无法与待提交状态一一匹配"), { code: "server_readback_mapping_failed" });
     }
-    fallbackByKey.set(key, index);
+    fallbackByDetail.set(detailIdentity, index);
     const outerId = String(row?.skuOuterId ?? "");
     if (outerId && outerIdCounts.get(outerId) === 1) fallbackByOuterId.set(outerId, index);
+  }
+  for (const [index, row] of fallback.entries()) {
+    const key = rowSalePropKey(row);
+    if (keyCounts.get(key) === 1) fallbackByKey.set(key, index);
   }
 
   const seen = new Set();
   const merged = activeRows(serverRows).map((serverRow) => {
     const outerId = String(serverRow?.skuOuterId ?? "");
     const key = rowSalePropKey(serverRow);
+    const detailIdentity = rowDetailIdentity(serverRow);
     const fallbackIndex = outerId && fallbackByOuterId.has(outerId)
       ? fallbackByOuterId.get(outerId)
-      : key ? fallbackByKey.get(key) : null;
+      : detailIdentity && fallbackByDetail.has(detailIdentity)
+        ? fallbackByDetail.get(detailIdentity)
+        : key ? fallbackByKey.get(key) : null;
     const fallbackRow = fallbackIndex == null ? null : fallback[fallbackIndex];
     if (!fallbackRow || seen.has(fallbackIndex)) {
       throw Object.assign(new Error("服务端回读 SKU 组合缺失、重复或无法匹配"), { code: "server_readback_mapping_failed" });
     }
     seen.add(fallbackIndex);
-    return {
+    const merged = {
       ...clone(fallbackRow),
       ...clone(serverRow),
       props: mergeServerProps(fallbackRow.props, serverRow.props),
       salePropKey: key || rowSalePropKey(fallbackRow),
     };
+    for (const [field, fallbackValue] of skuParamEntries(fallbackRow)) {
+      const serverValue = serverRow?.[field];
+      merged[field] = fallbackValue && typeof fallbackValue === "object" && serverValue && typeof serverValue === "object"
+        ? { ...clone(fallbackValue), ...clone(serverValue) }
+        : clone(serverValue ?? fallbackValue);
+    }
+    return merged;
   });
   if (seen.size !== fallback.length) {
     throw Object.assign(new Error("服务端回读 SKU 数量与待提交状态不一致"), { code: "server_readback_count_mismatch" });
@@ -408,16 +468,13 @@ function chooseTemporaryProperty(formValues, salePropMeta) {
     const supportsCustomValue = meta?.hasCustomProp === true || meta?.isCustomSelectSaleProp === true || hasExistingCustomValue;
     return { key, meta, originalValues, withinCustomLimit, hasExistingCustomValue, supportsCustomValue };
   }).filter(({ meta, originalValues, withinCustomLimit, supportsCustomValue }) => meta && supportsCustomValue && originalValues.length > 0 && withinCustomLimit);
-  const uncheckedCandidates = candidates.filter(({ meta }) => !meta.checkUrl);
-  if (!uncheckedCandidates.length && candidates.length) {
-    throw Object.assign(new Error("可自定义销售属性需要额外异步校验，当前适配器未执行该校验"), { code: "sale_prop_custom_check_required" });
-  }
-  uncheckedCandidates.sort((a, b) => {
+  candidates.sort((a, b) => {
+    if (Boolean(a.meta.checkUrl) !== Boolean(b.meta.checkUrl)) return a.meta.checkUrl ? 1 : -1;
     const aScore = (a.hasExistingCustomValue ? 8 : 0) + (a.meta.required === true ? 0 : 4) + (a.meta.hasCustomProp === true ? 2 : 0);
     const bScore = (b.hasExistingCustomValue ? 8 : 0) + (b.meta.required === true ? 0 : 4) + (b.meta.hasCustomProp === true ? 2 : 0);
     return bScore - aScore || a.key.localeCompare(b.key);
   });
-  const candidate = uncheckedCandidates[0];
+  const candidate = candidates[0];
   if (!candidate) {
     throw Object.assign(new Error("没有找到页面明确允许自定义值且容量足够的销售属性"), { code: "sale_prop_custom_value_unsupported" });
   }
@@ -429,7 +486,7 @@ function chooseTemporaryProperty(formValues, salePropMeta) {
 
 function buildTemporaryForm(formValues, task, salePropMeta) {
   const next = clone(formValues);
-  const { key, originalValues, maxLength } = chooseTemporaryProperty(formValues, salePropMeta);
+  const { key, originalValues, maxLength, meta } = chooseTemporaryProperty(formValues, salePropMeta);
   const token = uniqueToken(task);
   const usedValueIds = new Set(Object.values(formValues?.saleProp || {}).flatMap((values) => Array.isArray(values) ? values.map((value) => String(value?.value ?? "")) : []));
   let valueId = -(100_000_000 + (Number.parseInt(crypto.createHash("sha256").update(token).digest("hex").slice(0, 8), 16) % 800_000_000));
@@ -463,14 +520,11 @@ function buildTemporaryForm(formValues, task, salePropMeta) {
     updated.sourceSkuId = null;
     updated.skuOuterId = `${token}_${index + 1}`;
     updated.skuBarcode = "";
-    for (const field of Object.keys(updated)) {
-      if (field.startsWith("skuParam_p-")) delete updated[field];
-    }
     updated.props = (updated.props || []).map((prop) => prop.name === key ? { ...prop, value: selected.value, text: selected.text } : prop);
     updated.salePropKey = canonicalSalePropKeyFromProps(updated.props);
     return updated;
   });
-  return { formValues: next, key, token };
+  return { formValues: next, key, token, meta: clone(meta), temporaryValues };
 }
 
 function buildRestoreForm(original, current, token) {
@@ -552,22 +606,28 @@ async function fetchInitialState(page, baseUrl) {
     global: parsed.global,
     channelData: null,
     salePropMeta: normalizeSalePropMeta(parsed.salePropMeta),
+    detailVariant: detectPublishVariant(formValues, normalizeSalePropMeta(parsed.salePropMeta)),
   };
 }
 
 async function loadReadback(page, baseUrl, fallbackState, phase, accepts) {
   const startedAt = Date.now();
+  const regularAttempts = phase === "final_readback" ? FINAL_READBACK_ATTEMPTS : TEMP_READBACK_ATTEMPTS;
+  const maxAttempts = regularAttempts + (phase === "final_readback" ? 1 : 0);
   let lastState = null;
   let lastError = null;
-  for (let attempt = 1; attempt <= READBACK_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       const parsed = await fetchServerReadback(page, baseUrl);
+      const salePropMeta = normalizeSalePropMeta(parsed.salePropMeta) || fallbackState?.salePropMeta || [];
+      const mergedForm = mergeServerForm(fallbackState?.formValues, parsed.formValues);
       lastState = {
         ready: true,
-        formValues: mergeServerForm(fallbackState?.formValues, parsed.formValues),
+        formValues: mergedForm,
         global: mergeServerGlobal(fallbackState?.global, parsed.global),
         channelData: null,
-        salePropMeta: normalizeSalePropMeta(parsed.salePropMeta) || fallbackState?.salePropMeta || [],
+        salePropMeta,
+        detailVariant: detectPublishVariant(mergedForm, salePropMeta),
         readback: {
           phase,
           method: "GET",
@@ -586,7 +646,10 @@ async function loadReadback(page, baseUrl, fallbackState, phase, accepts) {
     } catch (error) {
       lastError = error;
     }
-    if (attempt < READBACK_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, READBACK_DELAY_MS));
+    if (attempt < maxAttempts) {
+      const delay = phase === "final_readback" && attempt === regularAttempts ? FINAL_READBACK_GRACE_MS : READBACK_DELAY_MS;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
   }
   if (lastState) return lastState;
   throw Object.assign(new Error(`纯接口回读失败: ${lastError?.message || "未知错误"}`), {
@@ -595,50 +658,148 @@ async function loadReadback(page, baseUrl, fallbackState, phase, accepts) {
   });
 }
 
+function customCheckMessage(payload) {
+  const message = payload?.models?.globalMessage || payload?.globalMessage || {};
+  const first = Array.isArray(message.message) ? message.message[0] : message.message;
+  return typeof first === "object" ? first?.msg || first?.message : first;
+}
+
+async function validateCustomSalePropValues(page, candidate, values, baseUrl) {
+  const checkUrl = String(candidate?.meta?.checkUrl || "");
+  if (!checkUrl) return [];
+  let endpoint;
+  try { endpoint = new URL(checkUrl, baseUrl); } catch (cause) {
+    throw Object.assign(new Error("自定义销售属性异步校验地址无效"), { code: "sale_prop_custom_check_invalid", cause });
+  }
+  const optType = endpoint.searchParams.get("optType") || "";
+  if (endpoint.origin !== PUBLISH_ORIGIN || endpoint.pathname !== "/tmall/asyncOpt.htm" || !/^tmall_new_check_custom_[a-z0-9_]+$/i.test(optType)) {
+    throw Object.assign(new Error("自定义销售属性异步校验地址不在允许范围内"), { code: "sale_prop_custom_check_invalid" });
+  }
+  const propertyId = String(candidate.meta.propertyId || candidate.key.replace(/^p-/, ""));
+  const texts = [...new Set((values || []).map((value) => String(value?.text ?? "")).filter(Boolean))];
+  const checks = [];
+  for (const keyword of texts) {
+    const url = new URL(endpoint.toString());
+    url.searchParams.set("keyword", keyword);
+    url.searchParams.set("pid", propertyId);
+    const startedAt = Date.now();
+    const result = await apiFetch(page, url.toString(), { method: "GET" });
+    let payload = null;
+    try { payload = JSON.parse(result.text || "{}"); } catch {}
+    const globalMessage = payload?.models?.globalMessage || payload?.globalMessage || {};
+    const type = String(globalMessage.type || "").toLowerCase();
+    if (result.status < 200 || result.status >= 300 || type === "error" || payload?.success === false) {
+      throw Object.assign(new Error(customCheckMessage(payload) || `自定义销售属性校验失败（HTTP ${result.status}）`), {
+        code: "sale_prop_custom_check_rejected",
+        status: result.status,
+        propertyId,
+      });
+    }
+    checks.push({ path: "/tmall/asyncOpt.htm", method: "GET", status: result.status, durationMs: Date.now() - startedAt, businessCode: "SUCCESS" });
+  }
+  return checks;
+}
+
+function normalizePreviewRows(payload) {
+  const raw = payload?.data?.value ?? payload?.data?.sku ?? payload?.data?.rows ?? payload?.models?.sku ?? payload?.value;
+  if (Array.isArray(raw)) return raw;
+  if (!raw || typeof raw !== "object") return null;
+  const entries = Object.values(raw);
+  if (entries.every((entry) => entry && typeof entry === "object" && !Array.isArray(entry))) return entries;
+  if (entries.every(Array.isArray)) return entries.flat();
+  return null;
+}
+
 async function previewSalePropValues(page, formValues, global) {
   const endpoint = new URL(`${ASYNC_OPT}?optType=salePropValueChangeAsync&catId=${global?.catId || ""}&requiredKey=keyProp&brandId=${global?.brand?.brandId || ""}&itemId=${global?.id || ""}&spuId=${global?.spuApply || ""}`, PUBLISH_ORIGIN).toString();
   const body = new URLSearchParams({ itemId: String(global?.id || ""), jsonBody: JSON.stringify(formValues), globalExtendInfo: global?.globalExtendInfo || "" });
   const result = await apiFetch(page, endpoint, { method: "POST", body });
   let payload;
   try { payload = JSON.parse(result.text || "{}"); } catch { payload = null; }
-  const rows = payload?.data?.value;
-  if (result.status < 200 || result.status >= 300 || payload?.success !== true || !Array.isArray(rows)) {
+  const rows = normalizePreviewRows(payload);
+  const success = payload?.success === true || payload?.data?.success === true || payload?.models?.globalMessage?.type === "success";
+  if (result.status < 200 || result.status >= 300 || !success || !Array.isArray(rows)) {
     throw Object.assign(new Error("销售属性预检未返回 SKU 组合"), { code: "sale_prop_preview_failed", status: result.status, response: payload });
   }
   return { endpoint, status: result.status, rows };
 }
 
 function mergePreviewRows(desiredRows, previewRows) {
-  if (!Array.isArray(previewRows) || previewRows.length !== desiredRows.length) {
-    throw Object.assign(new Error("销售属性预检返回的 SKU 组合数量不一致"), { code: "sale_prop_preview_count_mismatch", expected: desiredRows.length, actual: previewRows?.length });
+  if (!Array.isArray(previewRows) || !previewRows.length) {
+    throw Object.assign(new Error("销售属性预检未返回 SKU 组合"), { code: "sale_prop_preview_count_mismatch", expected: desiredRows.length, actual: previewRows?.length || 0 });
+  }
+  const desiredByKey = new Map();
+  for (const desired of desiredRows) {
+    const key = canonicalSalePropKeyFromProps(desired?.props);
+    const group = desiredByKey.get(key) || [];
+    group.push(desired);
+    desiredByKey.set(key, group);
   }
   const previewByKey = new Map();
   for (const preview of previewRows) {
     const key = canonicalSalePropKey(preview?.salePropKey);
-    if (previewByKey.has(key)) throw Object.assign(new Error(`销售属性预检返回重复组合: ${key}`), { code: "sale_prop_preview_duplicate" });
-    previewByKey.set(key, preview);
+    const group = previewByKey.get(key) || [];
+    group.push(preview);
+    previewByKey.set(key, group);
   }
-  const consumed = new Set();
-  const mergedRows = desiredRows.map((desired) => {
-    const desiredKey = canonicalSalePropKeyFromProps(desired?.props);
-    const preview = previewByKey.get(desiredKey);
-    if (!preview) throw Object.assign(new Error(`销售属性预检缺少组合: ${desiredKey}`), { code: "sale_prop_preview_mapping_failed" });
-    consumed.add(desiredKey);
-    const merged = { ...clone(preview), ...clone(desired) };
-    merged.salePropKey = preview.salePropKey;
-    merged.skuId = null;
-    merged.skuOldSku = null;
-    merged.sourceSkuId = null;
-    merged.skuPrice = desired.skuPrice;
-    merged.skuStock = desired.skuStock;
-    merged.skuOuterId = desired.skuOuterId;
-    merged.skuBarcode = desired.skuBarcode;
-    merged.skuStatus = desired.skuStatus;
-    merged.status = desired.status;
-    merged.action = { selected: true };
-    return merged;
-  });
-  if (consumed.size !== previewByKey.size) throw Object.assign(new Error("销售属性预检包含未识别的 SKU 组合"), { code: "sale_prop_preview_mapping_failed" });
+  const desiredKeys = [...desiredByKey.keys()].sort();
+  const previewKeys = [...previewByKey.keys()].sort();
+  const missing = desiredKeys.filter((key) => !previewByKey.has(key));
+  const extra = previewKeys.filter((key) => !desiredByKey.has(key));
+  const placeholderOnlyExtra = extra.every((key) => previewByKey.get(key).every((row) => !positiveSkuId(row?.skuId)
+    && skuParamEntries(row).length === 0
+    && !row?.skuOuterId
+    && !row?.skuBarcode));
+  if (missing.length || (extra.length && !placeholderOnlyExtra)) {
+    throw Object.assign(new Error(`销售属性预检组合与商品明细不一致：缺少 ${missing.length} 个，新增 ${extra.length} 个`), {
+      code: "sale_prop_preview_count_mismatch",
+      expected: desiredRows.length,
+      actual: previewRows.length,
+      missing,
+      extra,
+    });
+  }
+  const mergedRows = [];
+  for (const desiredKey of desiredKeys) {
+    const desiredGroup = desiredByKey.get(desiredKey);
+    const previewGroup = previewByKey.get(desiredKey);
+    if (previewGroup.length > desiredGroup.length) {
+      throw Object.assign(new Error(`销售属性预检返回重复组合: ${desiredKey}`), { code: "sale_prop_preview_duplicate" });
+    }
+    if (previewGroup.length !== 1 && previewGroup.length !== desiredGroup.length) {
+      throw Object.assign(new Error(`销售属性预检明细数量无法匹配: ${desiredKey}`), { code: "sale_prop_preview_count_mismatch", expected: desiredGroup.length, actual: previewGroup.length });
+    }
+    const previewFingerprints = previewGroup.map((row) => canonicalize(Object.fromEntries(Object.entries(row || {}).filter(([key]) => key !== "salePropKey" && key !== "skuId" && key !== "skuOldSku" && key !== "sourceSkuId" && key !== "action" && key !== "props" && !key.startsWith("skuParam_p-")))));
+    const homogeneousPreview = previewFingerprints.every((fingerprint) => JSON.stringify(fingerprint) === JSON.stringify(previewFingerprints[0]));
+    const previewForRow = previewGroup.length === 1
+      ? () => previewGroup[0]
+      : homogeneousPreview
+        ? () => previewGroup[0]
+      : (() => {
+        const byDetail = new Map(previewGroup.map((row) => [rowDetailIdentity(row), row]));
+        if ([...byDetail.keys()].some((key) => !key) || byDetail.size !== previewGroup.length) {
+          throw Object.assign(new Error(`销售属性预检明细无法一一映射: ${desiredKey}`), { code: "sale_prop_preview_mapping_failed" });
+        }
+        return (desired) => byDetail.get(rowDetailIdentity(desired));
+      })();
+    for (const desired of desiredGroup) {
+      const preview = previewForRow(desired);
+      if (!preview) throw Object.assign(new Error(`销售属性预检缺少 SKU 明细: ${rowDetailIdentity(desired)}`), { code: "sale_prop_preview_mapping_failed" });
+      const merged = { ...clone(preview), ...clone(desired) };
+      merged.salePropKey = preview.salePropKey;
+      merged.skuId = null;
+      merged.skuOldSku = null;
+      merged.sourceSkuId = null;
+      merged.skuPrice = desired.skuPrice;
+      merged.skuStock = desired.skuStock;
+      merged.skuOuterId = desired.skuOuterId;
+      merged.skuBarcode = desired.skuBarcode;
+      merged.skuStatus = desired.skuStatus;
+      merged.status = desired.status;
+      merged.action = { selected: true };
+      mergedRows.push(merged);
+    }
+  }
   return mergedRows;
 }
 
@@ -657,10 +818,12 @@ function prewriteCombinations(rows, phase) {
       const propsKey = canonicalSalePropKeyFromProps(row?.props);
       const storedKey = canonicalSalePropKey(row?.salePropKey);
       if (propsKey !== storedKey) throw new Error("salePropKey 与 props 不一致");
-      return { key: propsKey, row };
+      const identity = rowDetailIdentity(row);
+      if (!identity) throw new Error("SKU 明细缺少可识别的销售属性组合");
+      return { key: propsKey, identity, row };
     });
-    if (new Set(combinations.map(({ key }) => key)).size !== combinations.length) {
-      throw new Error("销售属性组合重复");
+    if (new Set(combinations.map(({ identity }) => identity)).size !== combinations.length) {
+      throw new Error("SKU 明细组合重复");
     }
     return combinations;
   } catch (cause) {
@@ -670,8 +833,8 @@ function prewriteCombinations(rows, phase) {
 }
 
 function assertSameCombinationSet(expected, actual, phase) {
-  const expectedKeys = expected.map(({ key }) => key).sort();
-  const actualKeys = actual.map(({ key }) => key).sort();
+  const expectedKeys = expected.map(({ identity }) => identity).sort();
+  const actualKeys = actual.map(({ identity }) => identity).sort();
   if (JSON.stringify(expectedKeys) !== JSON.stringify(actualKeys)) {
     throw prewriteStateError(phase, "销售属性组合与构造状态不一致");
   }
@@ -733,8 +896,8 @@ function validateFinalPrewrite(expectedForm, actualForm, generatedIds) {
     || JSON.stringify([...actualIds].sort()) !== JSON.stringify(generatedSet)) {
     throw prewriteStateError(phase, "新 SKU ID 集合不精确");
   }
-  const expectedIdByCombination = new Map(expectedCombinations.map(({ key, row }) => [key, positiveSkuId(row?.skuId)]));
-  if (actualCombinations.some(({ key, row }) => expectedIdByCombination.get(key) !== positiveSkuId(row?.skuId))) {
+  const expectedIdByCombination = new Map(expectedCombinations.map(({ identity, row }) => [identity, positiveSkuId(row?.skuId)]));
+  if (actualCombinations.some(({ identity, row }) => expectedIdByCombination.get(identity) !== positiveSkuId(row?.skuId))) {
     throw prewriteStateError(phase, "新 SKU ID 与销售属性组合的映射不一致");
   }
   if (actualRows.some((row) => row.skuOldSku !== null || row.sourceSkuId !== null)) {
@@ -818,6 +981,8 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   const channelOption = normalizeChannelOption(original);
   original.channelOption = channelOption;
   const originalSummary = summarizeForm(original);
+  originalSummary.detailVariant = clone(state.detailVariant || detectPublishVariant(original, state.salePropMeta));
+  task.detailVariant = originalSummary.detailVariant;
   if (!originalSummary.skuCount) throw Object.assign(new Error("商品没有可处理的 SKU"), { code: "sku_rows_missing" });
   assertExactUniqueSkuIds(originalSummary, originalSummary.skuCount, "sku_snapshot_id_invalid");
   if (task.expectedSkuCount != null && Number(task.expectedSkuCount) !== originalSummary.skuCount) {
@@ -842,9 +1007,15 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   recoverySnapshot.sha256 = canonicalHash(recoverySnapshot);
   await invokeHook("onRecoverySnapshot", recoverySnapshot);
   await invokeHook("onSnapshot", { phase: "before", summary: originalSummary });
-  await reportPhase("reading_snapshot", `已读取商品快照：${originalSummary.skuCount} 个 SKU`, "info", 12);
+  const variantLabel = originalSummary.detailVariant.kind === "sku_detail" ? "SKU 明细结构" : "标准 SKU 结构";
+  const customCheckLabel = originalSummary.detailVariant.customCheckKeys.length ? `，${originalSummary.detailVariant.customCheckKeys.length} 个销售属性需异步校验` : "";
+  await reportPhase("reading_snapshot", `已读取商品快照：${originalSummary.skuCount} 个 SKU（${variantLabel}${customCheckLabel}）`, "info", 12);
 
   const temporary = buildTemporaryForm(original, task, state.salePropMeta);
+  const customChecks = await validateCustomSalePropValues(page, temporary, temporary.temporaryValues, baseUrl);
+  for (const check of customChecks) {
+    await invokeHook("onNetwork", { phase: "sale_prop_custom_check", ...check });
+  }
   const temporaryPreview = await previewSalePropValues(page, temporary.formValues, state.global);
   const temporaryRows = mergePreviewRows(temporary.formValues.sku, temporaryPreview.rows);
   temporary.formValues.sku = temporaryRows;
@@ -914,5 +1085,5 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   }
   await invokeHook("onSnapshot", { phase: "after", summary: finalSummary, comparison });
   await reportPhase("final_verifying", "最终回读一致：原规格字段已恢复且 SKU ID 已更新（库存采用平台实时值）", "success", 100);
-  return { oldSkuIds: originalSummary.skuIds, newSkuIds: finalIds, skuCount: finalSummary.skuCount, comparison, hookErrors };
+  return { oldSkuIds: originalSummary.skuIds, newSkuIds: finalIds, skuCount: finalSummary.skuCount, detailVariant: originalSummary.detailVariant, comparison, hookErrors };
 }

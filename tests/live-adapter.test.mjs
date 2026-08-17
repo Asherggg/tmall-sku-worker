@@ -4,6 +4,7 @@ import {
   buildSubmitBody,
   classifySubmitResponse,
   compareSkuRows,
+  detectPublishVariant,
   executeTmallRebuild,
   extractServerFormFromHtml,
   mergeServerForm,
@@ -172,10 +173,16 @@ class MockTmallPage {
       let html = bootstrapHtml(this.serverForm, this.salePropMeta, this.globalItemId);
       if (this.submitCount > 0 && this.options.fastReadbackHtml) {
         html = typeof this.options.fastReadbackHtml === "function"
-          ? this.options.fastReadbackHtml(this.serverForm, this.salePropMeta, this.globalItemId)
+          ? this.options.fastReadbackHtml(this.serverForm, this.salePropMeta, this.globalItemId, { getCount: this.getCount, submitCount: this.submitCount })
           : this.options.fastReadbackHtml;
       }
       return this.#response(url, 200, html);
+    }
+    if (method === "GET" && parsedUrl.pathname === "/tmall/asyncOpt.htm" && parsedUrl.searchParams.get("optType") === "tmall_new_check_custom_color") {
+      if (this.options.customCheckError) {
+        return this.#response(url, 200, JSON.stringify({ models: { globalMessage: { type: "error", message: [{ msg: this.options.customCheckError }] } } }));
+      }
+      return this.#response(url, 200, JSON.stringify({ models: { globalMessage: { type: "success" } } }));
     }
     if (method === "POST" && parsedUrl.pathname === "/tmall/asyncOpt.htm") return this.#previewResponse(init, url);
     if (method === "POST" && parsedUrl.pathname === "/tmall/submit.htm") {
@@ -201,6 +208,9 @@ class MockTmallPage {
   #submit(submitted, url) {
     this.submitCount += 1;
     this.submittedForms.push(clone(submitted));
+    if (this.options.requiresSkuParam && submitted.sku.some((row) => !Object.keys(row).some((key) => key.startsWith("skuParam_p-")))) {
+      return this.#response(url, 200, JSON.stringify({ models: { formError: { sku: { message: [{ code: "CHK_SKU_PARAM_REQUIRED_ERROR", msg: "缺少 SKU 参数" }] } } } }));
+    }
     let savedRows = clone(submitted.sku);
     if (this.submitCount === 1) {
       const ids = this.options.temporaryIds || ["6125801697539", "6125801697540"];
@@ -330,6 +340,22 @@ test("form summary keeps active current and old IDs without request secrets", ()
   assert.equal(JSON.stringify(summary).includes("token"), false);
 });
 
+test("detects SKU-detail pages and preserves required skuParam fields", async () => {
+  const form = makeForm();
+  form.sku[1].props = clone(form.sku[0].props);
+  form.sku[0]["skuParam_p-5569827"] = { value: "1001", text: "1.5米床" };
+  form.sku[1]["skuParam_p-5569827"] = { value: "1002", text: "1.5米床" };
+  const page = new MockTmallPage(form, {
+    requiresSkuParam: true,
+    previewRows(rows) { return [rows[0]]; },
+  });
+  const result = await executeTmallRebuild(page, task());
+  assert.equal(detectPublishVariant(form, defaultSalePropMeta()).kind, "sku_detail");
+  assert.equal(result.skuCount, 2);
+  assert.equal(page.submitCount, 2);
+  assert.ok(page.submittedForms.every((submitted) => submitted.sku.every((row) => row["skuParam_p-5569827"])));
+});
+
 test("pure API two-phase rebuild matches reversed preview rows without page navigation", async () => {
   const page = new MockTmallPage();
   const result = await executeTmallRebuild(page, task());
@@ -359,6 +385,46 @@ test("pure API two-phase rebuild matches reversed preview rows without page navi
   assert.deepEqual(page.submittedForms[1].sku.map((row) => row.skuPicture), makeForm().sku.map((row) => row.skuPicture));
 });
 
+test("preview responses may use an object map on alternate detail pages", async () => {
+  const page = new MockTmallPage(makeForm(), {
+    previewRows(rows) {
+      return Object.fromEntries(rows.map((row) => [row.salePropKey, row]));
+    },
+  });
+  const result = await executeTmallRebuild(page, task());
+  assert.equal(result.skuCount, 2);
+  assert.equal(page.submitCount, 2);
+});
+
+test("preview ignores only empty Cartesian placeholder combinations", async () => {
+  const page = new MockTmallPage(makeForm(), {
+    previewRows(rows) {
+      return [...rows, {
+        salePropKey: "1627207--999999999_5569827--1001",
+        skuId: 0,
+        skuPicture: null,
+        skuTitle: null,
+      }];
+    },
+  });
+  const result = await executeTmallRebuild(page, task());
+  assert.equal(result.skuCount, 2);
+  assert.equal(page.submitCount, 2);
+});
+
+test("preview rejects extra combinations carrying an existing SKU identity", async () => {
+  const page = new MockTmallPage(makeForm(), {
+    previewRows(rows) {
+      return [...rows, {
+        salePropKey: "1627207--999999999_5569827--1001",
+        skuId: "6125801697599",
+      }];
+    },
+  });
+  await assert.rejects(executeTmallRebuild(page, task()), (error) => error.code === "sale_prop_preview_count_mismatch");
+  assert.equal(page.submitCount, 0);
+});
+
 test("two-phase rebuild uses API server bootstrap readback only", async () => {
   const page = new MockTmallPage();
   const readbacks = [];
@@ -380,6 +446,19 @@ test("final verification accepts platform inventory drift while retaining all ot
   assert.equal(result.comparison.equal, true);
   assert.deepEqual(result.comparison.ignoredFields, ["skuStock"]);
   assert.equal(page.serverForm.sku.some((row, index) => Number(row.skuStock) !== Number(makeForm().sku[index]?.skuStock)), true);
+});
+
+test("final readback waits beyond the temporary window for eventual consistency", async () => {
+  const page = new MockTmallPage(makeForm(), {
+    fastReadbackHtml(form, salePropMeta, itemId, context) {
+      const stale = clone(form);
+      if (context.submitCount === 2 && context.getCount < 15) stale.sku[0].skuTitle = "平台仍在收敛";
+      return bootstrapHtml(stale, salePropMeta, itemId);
+    },
+  });
+  const result = await executeTmallRebuild(page, task());
+  assert.equal(result.comparison.equal, true);
+  assert.ok(page.getCount >= 15);
 });
 
 test("malformed API bootstrap readback fails closed without page fallback", async () => {
@@ -444,7 +523,7 @@ test("temporary property requires explicit custom-value metadata and capacity", 
   assert.equal(page.submitCount, 0);
 });
 
-test("a custom property with checkUrl is rejected unless its async validation is implemented", async () => {
+test("a custom property with checkUrl runs the page-compatible async validation before preview", async () => {
   const page = new MockTmallPage(makeForm(), {
     salePropMeta: {
       "p-5569827": { name: "p-5569827", required: true, maxCustomItems: 0, maxLength: 30 },
@@ -454,7 +533,27 @@ test("a custom property with checkUrl is rejected unless its async validation is
       },
     },
   });
-  await assert.rejects(executeTmallRebuild(page, task()), (error) => error.code === "sale_prop_custom_check_required");
+  const result = await executeTmallRebuild(page, task());
+  assert.equal(result.skuCount, 2);
+  const checks = page.apiCalls.filter((entry) => new URL(entry.url).searchParams.get("optType") === "tmall_new_check_custom_color");
+  assert.equal(checks.length, 2);
+  assert.ok(checks.every((entry) => typeof entry.url === "string"));
+  assert.ok(checks.every((entry) => new URL(entry.url).searchParams.get("pid") === "1627207"));
+  assert.equal(page.submitCount, 2);
+});
+
+test("custom property validation errors stop before any write", async () => {
+  const page = new MockTmallPage(makeForm(), {
+    customCheckError: "自定义颜色不允许",
+    salePropMeta: {
+      "p-5569827": { name: "p-5569827", required: true, maxCustomItems: 0, maxLength: 30 },
+      "p-1627207": {
+        name: "p-1627207", required: false, hasCustomProp: true, maxCustomItems: 30, maxLength: 30,
+        checkUrl: "asyncOpt.htm?optType=tmall_new_check_custom_color",
+      },
+    },
+  });
+  await assert.rejects(executeTmallRebuild(page, task()), (error) => error.code === "sale_prop_custom_check_rejected");
   assert.equal(page.submitCount, 0);
 });
 
@@ -464,6 +563,6 @@ test("preview rows cannot fall back to array position when a salePropKey is miss
       return [{ ...rows[0], salePropKey: rows[1].salePropKey }, rows[1]];
     },
   });
-  await assert.rejects(executeTmallRebuild(page, task()), (error) => error.code === "sale_prop_preview_duplicate");
+  await assert.rejects(executeTmallRebuild(page, task()), (error) => ["sale_prop_preview_duplicate", "sale_prop_preview_count_mismatch"].includes(error.code));
   assert.equal(page.submitCount, 0);
 });
