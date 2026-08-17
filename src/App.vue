@@ -37,7 +37,7 @@ import {
 import type { BatchRecord, ImportPreview, TaskRecord, WorkerHealth } from "./types";
 
 type View = "overview" | "import" | "queue" | "browser" | "audit";
-const EXPECTED_WORKER_VERSION = "0.1.9";
+const EXPECTED_WORKER_VERSION = "0.1.10";
 
 const view = ref<View>("overview");
 const health = ref<WorkerHealth>({ ready: false, mode: "demo", workerVersion: "-", browser: "unavailable", profile: "-", loggedIn: false, contract: "demo" });
@@ -59,7 +59,7 @@ const liveRuntimeReady = computed(() => health.value.ready
   && health.value.contract === "configured");
 const liveRuntimeMessage = computed(() => {
   if (!health.value.ready) return "Worker 未启动，不能执行线上任务";
-  if (health.value.workerVersion !== EXPECTED_WORKER_VERSION) return `当前连接的是旧 Worker ${health.value.workerVersion}，请退出旧版后重新打开 0.1.9`;
+  if (health.value.workerVersion !== EXPECTED_WORKER_VERSION) return `当前连接的是旧 Worker ${health.value.workerVersion}，请退出旧版后重新打开 0.1.10`;
   if (health.value.mode !== "live" || health.value.contract !== "configured") return "当前 Worker 未启用 tmall-publish-v2 纯接口适配器";
   return "";
 });
@@ -159,27 +159,43 @@ async function handleRetry(task: TaskRecord) {
 }
 
 function canDeleteTask(task: TaskRecord) {
-  if (["reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying"].includes(task.status)) return false;
-  return !(task.mode === "live" && task.liveWriteStarted && task.status !== "succeeded");
+  return !["reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying"].includes(task.status);
 }
 
 async function handleDelete(task: TaskRecord) {
   if (!canDeleteTask(task)) {
-    ElMessage.warning("任务正在执行或已进入线上写入阶段，不能删除");
+    ElMessage.warning("任务正在执行，不能删除");
     return;
   }
   try {
-    await ElMessageBox.confirm(`删除商品 ${task.itemId} 的任务？删除后会从任务队列移除，但审计记录仍会保留。`, "删除任务", {
-      type: "warning",
-      confirmButtonText: "删除",
-      cancelButtonText: "取消",
-    });
-    await deleteTask(task.id);
+    const needsManualResolution = task.mode === "live" && task.liveWriteStarted && task.status === "needs_manual_review";
+    let deletionConfirmation: string | undefined;
+    if (needsManualResolution) {
+      const result = await ElMessageBox.prompt(
+        `该任务已经发出过线上写入。删除只会解除本地锁定，不会撤销天猫变更。请先核对商品 ${task.itemId} 的线上规格，再输入：确认已人工核对`,
+        "解除人工复核锁定并删除",
+        {
+          type: "warning",
+          confirmButtonText: "解除锁定并删除",
+          cancelButtonText: "取消",
+          inputPlaceholder: "确认已人工核对",
+          inputValidator: (value) => value === "确认已人工核对" || "确认词不正确",
+        },
+      );
+      deletionConfirmation = result.value;
+    } else {
+      await ElMessageBox.confirm(`删除商品 ${task.itemId} 的任务？删除后会从任务队列移除，但审计记录仍会保留。`, "删除任务", {
+        type: "warning",
+        confirmButtonText: "删除",
+        cancelButtonText: "取消",
+      });
+    }
+    const result = await deleteTask(task.id, deletionConfirmation);
     if (selectedTask.value?.id === task.id) {
       selectedTask.value = null;
       drawerOpen.value = false;
     }
-    ElMessage.success("任务已删除");
+    ElMessage.success(result.manuallyResolved ? "人工复核锁定已解除，任务已删除" : "任务已删除");
     await refresh();
   } catch (error) {
     if (error === "cancel" || error === "close") return;
@@ -339,7 +355,7 @@ onUnmounted(() => {
             <el-table-column label="状态" width="150"><template #default="scope"><el-tag size="small" :type="statusType(scope.row.status)">{{ statusLabel(scope.row.status) }}</el-tag></template></el-table-column>
             <el-table-column label="阶段"><template #default="scope"><span>{{ scope.row.phaseLabel }}</span><small v-if="scope.row.errorMessage" class="error-line">{{ scope.row.errorMessage }}</small></template></el-table-column>
             <el-table-column label="进度" width="170"><template #default="scope"><el-progress :percentage="scope.row.progress" :status="scope.row.status === 'succeeded' ? 'success' : undefined" :stroke-width="6" /></template></el-table-column>
-            <el-table-column label="操作" width="220"><template #default="scope"><div class="row-actions"><button v-if="scope.row.mode === 'demo' && runningTasks.includes(scope.row)" class="table-icon" title="暂停" @click.stop="handlePause(scope.row)"><Pause :size="15" /></button><button v-if="['failed','needs_manual_review'].includes(scope.row.status) && !(scope.row.mode === 'live' && scope.row.liveWriteStarted)" class="table-icon" title="重试" @click.stop="handleRetry(scope.row)"><RotateCcw :size="15" /></button><el-tag v-if="scope.row.mode === 'live' && scope.row.liveWriteStarted && scope.row.status === 'needs_manual_review'" type="danger" size="small">仅人工复核</el-tag><button v-if="canDeleteTask(scope.row)" class="table-icon delete-task-button" title="删除任务" @click.stop="handleDelete(scope.row)"><Trash2 :size="15" /></button><button class="table-icon" title="查看详情" @click.stop="openTask(scope.row)"><ArrowDownToLine :size="15" /></button></div></template></el-table-column>
+            <el-table-column label="操作" width="220"><template #default="scope"><div class="row-actions"><button v-if="scope.row.mode === 'demo' && runningTasks.includes(scope.row)" class="table-icon" title="暂停" @click.stop="handlePause(scope.row)"><Pause :size="15" /></button><button v-if="['failed','needs_manual_review'].includes(scope.row.status) && !(scope.row.mode === 'live' && scope.row.liveWriteStarted)" class="table-icon" title="重试" @click.stop="handleRetry(scope.row)"><RotateCcw :size="15" /></button><el-tag v-if="scope.row.mode === 'live' && scope.row.liveWriteStarted && scope.row.status === 'needs_manual_review'" type="danger" size="small">需核对后删除</el-tag><button v-if="canDeleteTask(scope.row)" class="table-icon delete-task-button" title="删除任务" @click.stop="handleDelete(scope.row)"><Trash2 :size="15" /></button><button class="table-icon" title="查看详情" @click.stop="openTask(scope.row)"><ArrowDownToLine :size="15" /></button></div></template></el-table-column>
           </el-table>
         </div>
       </section>

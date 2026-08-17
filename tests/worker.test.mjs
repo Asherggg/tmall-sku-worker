@@ -146,7 +146,7 @@ test("tasks can be manually deleted before live writing starts", async () => {
 
   const deletion = await fetch(`http://127.0.0.1:${port}/tasks/${taskId}`, { method: "DELETE" });
   assert.equal(deletion.status, 200);
-  assert.deepEqual(await deletion.json(), { deleted: true, taskId, batchId, removedBatch: true });
+  assert.deepEqual(await deletion.json(), { deleted: true, taskId, batchId, removedBatch: true, manuallyResolved: false });
   assert.equal((await fetch(`http://127.0.0.1:${port}/tasks/${taskId}`)).status, 404);
   const batches = await (await fetch(`http://127.0.0.1:${port}/batches`)).json();
   assert.equal(batches.batches.some((batch) => batch.id === batchId), false);
@@ -349,6 +349,25 @@ test("an unresolved live write survives restart and locks the item", async () =>
       body: JSON.stringify({ mode: "live", confirmation: "确认线上重建", items: [{ itemId: "828872681902", skuIds: [] }] }),
     });
     assert.equal(unrelated.status, 201);
+
+    const unconfirmedDeletion = await fetch(`http://127.0.0.1:${isolatedPort}/tasks/old_task`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert.equal(unconfirmedDeletion.status, 409);
+    assert.equal((await unconfirmedDeletion.json()).error, "manual_review_confirmation_required");
+
+    const confirmedDeletion = await fetch(`http://127.0.0.1:${isolatedPort}/tasks/old_task`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ confirmation: "确认已人工核对" }),
+    });
+    assert.equal(confirmedDeletion.status, 200);
+    assert.equal((await confirmedDeletion.json()).manuallyResolved, true);
+    assert.equal((await (await fetch(`http://127.0.0.1:${isolatedPort}/health`)).json()).unresolvedLiveWrites, 0);
+    const audit = await (await fetch(`http://127.0.0.1:${isolatedPort}/audit/export`)).json();
+    assert.equal(audit.records.find((entry) => entry.taskId === "old_task")?.businessCode, "TASK_MANUALLY_RESOLVED_AND_DELETED");
   } finally {
     await stopWorker(isolatedChild);
   }

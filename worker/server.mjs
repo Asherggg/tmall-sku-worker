@@ -13,7 +13,8 @@ const HOST = process.env.TMALL_WORKER_HOST || "127.0.0.1";
 const DATA_DIR = process.env.TMALL_DATA_DIR || path.join(__dirname, "..", ".runtime", "tmall-worker");
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const CONFIRMATION = "确认线上重建";
-const VERSION = "0.1.9";
+const MANUAL_REVIEW_CONFIRMATION = "确认已人工核对";
+const VERSION = "0.1.10";
 const DEFAULT_LOGIN_URL = "https://myseller.taobao.com/home.htm/QnworkbenchHome/";
 const BROWSER_CDP_PORT = Number(process.env.TMALL_BROWSER_CDP_PORT || PORT + 1);
 
@@ -146,12 +147,14 @@ function unresolvedLiveWrite(itemId, exceptTaskId) {
 
 const ACTIVE_TASK_STATUSES = new Set(["reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying"]);
 
-function taskDeletionError(task) {
+function taskDeletionError(task, confirmation) {
   if (runningTaskIds.has(task.id) || ACTIVE_TASK_STATUSES.has(task.status)) {
     return "任务正在执行，必须等到当前阶段结束后才能删除";
   }
   if (task.mode === "live" && task.liveWriteStarted && task.status !== "succeeded") {
-    return "任务已经进入线上写入阶段，只能人工复核，不能删除";
+    if (task.status !== "needs_manual_review" || confirmation !== MANUAL_REVIEW_CONFIRMATION) {
+      return "任务已经进入线上写入阶段；请先人工核对线上商品，再输入确认词解除锁定并删除";
+    }
   }
   return null;
 }
@@ -640,11 +643,18 @@ async function route(request, response) {
       const taskId = pathname.split("/")[2];
       const task = state.tasks.find((entry) => entry.id === taskId);
       if (!task) return json(response, 404, { error: "task_not_found" }, rid);
-      const deletionError = taskDeletionError(task);
-      if (deletionError) return json(response, 409, { error: "task_not_deletable", message: deletionError }, rid);
+      const payload = await body(request);
+      const manuallyResolved = Boolean(task.mode === "live" && task.liveWriteStarted && task.status === "needs_manual_review");
+      const deletionError = taskDeletionError(task, payload.confirmation);
+      if (deletionError) return json(response, 409, { error: manuallyResolved ? "manual_review_confirmation_required" : "task_not_deletable", message: deletionError }, rid);
       const batch = state.batches.find((entry) => entry.id === task.batchId);
       removeTaskFromQueues(task.id);
-      addAudit(task, "deleted", { method: "DELETE", path: `/tasks/${task.id}`, status: 200, businessCode: "TASK_DELETED" });
+      addAudit(task, manuallyResolved ? "manual_review_resolved_and_deleted" : "deleted", {
+        method: "DELETE",
+        path: `/tasks/${task.id}`,
+        status: 200,
+        businessCode: manuallyResolved ? "TASK_MANUALLY_RESOLVED_AND_DELETED" : "TASK_DELETED",
+      });
       state.tasks = state.tasks.filter((entry) => entry.id !== task.id);
       let removedBatch = false;
       if (batch) {
@@ -652,7 +662,7 @@ async function route(request, response) {
         if (removedBatch) state.batches = state.batches.filter((entry) => entry.id !== batch.id);
       }
       saveState();
-      return json(response, 200, { deleted: true, taskId: task.id, batchId: task.batchId, removedBatch }, rid);
+      return json(response, 200, { deleted: true, taskId: task.id, batchId: task.batchId, removedBatch, manuallyResolved }, rid);
     }
     if (request.method === "POST" && pathname === "/tasks") {
       const payload = await body(request);
