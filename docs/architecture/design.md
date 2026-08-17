@@ -23,7 +23,7 @@ Tauri 2
 
 ### Worker
 
-- 源码直接启动默认 `demo`；v0.1.10 Windows 安装版由 Tauri host 显式启用 `tmall-publish-v2`。
+- 源码直接启动默认 `demo`；v0.1.11 Windows 安装版由 Tauri host 显式启用 `tmall-publish-v2`，桌面 UI 只提供线上模式。
 - `live` 必须同时满足环境开关、批次确认词和任务快照校验。
 - 一个 Profile 只有一个 Worker；同一账号同一时间只写一个 `itemId`。
 - 未知提交结果统一进入 `needs_manual_review`，禁止自动重试写请求。

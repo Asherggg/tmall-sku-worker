@@ -37,7 +37,9 @@ import {
 import type { BatchRecord, ImportPreview, TaskRecord, WorkerHealth } from "./types";
 
 type View = "overview" | "import" | "queue" | "browser" | "audit";
-const EXPECTED_WORKER_VERSION = "0.1.10";
+const EXPECTED_WORKER_VERSION = "0.1.11";
+const LIVE_CONFIRMATION = "确认线上重建";
+const PREVIEW_ITEM_LIMIT = 10;
 
 const view = ref<View>("overview");
 const health = ref<WorkerHealth>({ ready: false, mode: "demo", workerVersion: "-", browser: "unavailable", profile: "-", loggedIn: false, contract: "demo" });
@@ -46,20 +48,20 @@ const batches = ref<BatchRecord[]>([]);
 const selectedTask = ref<TaskRecord | null>(null);
 const drawerOpen = ref(false);
 const importText = ref("828872681901");
-const mode = ref<"demo" | "live">("demo");
-const confirmation = ref("");
 const isRefreshing = ref(false);
 const isSubmitting = ref(false);
 let refreshTimer: number | undefined;
 
 const preview = computed<ImportPreview>(() => parseImport(importText.value));
+const visiblePreviewItems = computed(() => preview.value.items.slice(0, PREVIEW_ITEM_LIMIT));
+const hiddenPreviewItemCount = computed(() => Math.max(0, preview.value.items.length - PREVIEW_ITEM_LIMIT));
 const liveRuntimeReady = computed(() => health.value.ready
   && health.value.workerVersion === EXPECTED_WORKER_VERSION
   && health.value.mode === "live"
   && health.value.contract === "configured");
 const liveRuntimeMessage = computed(() => {
   if (!health.value.ready) return "Worker 未启动，不能执行线上任务";
-  if (health.value.workerVersion !== EXPECTED_WORKER_VERSION) return `当前连接的是旧 Worker ${health.value.workerVersion}，请退出旧版后重新打开 0.1.10`;
+  if (health.value.workerVersion !== EXPECTED_WORKER_VERSION) return `当前连接的是旧 Worker ${health.value.workerVersion}，请退出旧版后重新打开 0.1.11`;
   if (health.value.mode !== "live" || health.value.contract !== "configured") return "当前 Worker 未启用 tmall-publish-v2 纯接口适配器";
   return "";
 });
@@ -96,28 +98,22 @@ async function refresh(silent = false) {
 
 async function handleCreateBatch() {
   if (!preview.value.valid || isSubmitting.value) return;
-  if (mode.value === "live") {
-    if (!liveRuntimeReady.value) {
-      ElMessage.error(liveRuntimeMessage.value);
-      return;
-    }
-    if (confirmation.value !== "确认线上重建") {
-      ElMessage.warning("请输入确认词：确认线上重建");
-      return;
-    }
-    try {
-      const scope = hasPendingSkuLookup.value
-        ? `${preview.value.items.length} 个商品，SKU 数将在读取快照后确认`
-        : `${preview.value.items.length} 个商品、${preview.value.skuCount} 个 SKU`;
-      await ElMessageBox.confirm(`将处理 ${scope}。线上写入不可自动撤回，是否继续？`, "线上写入确认", { type: "warning", confirmButtonText: "继续", cancelButtonText: "取消" });
-    } catch {
-      return;
-    }
+  if (!liveRuntimeReady.value) {
+    ElMessage.error(liveRuntimeMessage.value);
+    return;
+  }
+  try {
+    const scope = hasPendingSkuLookup.value
+      ? `${preview.value.items.length} 个商品，SKU 数将在读取快照后确认`
+      : `${preview.value.items.length} 个商品、${preview.value.skuCount} 个 SKU`;
+    await ElMessageBox.confirm(`将创建线上批次处理 ${scope}。线上写入不可自动撤回，是否继续？`, "线上写入确认", { type: "warning", confirmButtonText: "继续", cancelButtonText: "取消" });
+  } catch {
+    return;
   }
   isSubmitting.value = true;
   try {
-    await createBatch(preview.value.items, mode.value, confirmation.value);
-    ElMessage.success(mode.value === "demo" ? "演练批次已创建" : "线上批次已进入队列");
+    await createBatch(preview.value.items, "live", LIVE_CONFIRMATION);
+    ElMessage.success("线上批次已进入队列");
     view.value = "queue";
     await refresh();
   } catch (error) {
@@ -130,7 +126,7 @@ async function handleCreateBatch() {
 async function handleStartBatch() {
   if (!activeBatch.value) return;
   try {
-    await startBatch(activeBatch.value.id, confirmation.value);
+    await startBatch(activeBatch.value.id, LIVE_CONFIRMATION);
     ElMessage.success("批次已启动");
     await refresh();
   } catch (error) {
@@ -335,11 +331,10 @@ onUnmounted(() => {
             <div class="panel-head"><div><h3>批次预览</h3><span>创建前检查</span></div><ClipboardList :size="18" /></div>
             <div class="preview-stat"><span>商品数</span><strong>{{ preview.items.length }}</strong></div>
             <div class="preview-stat"><span>SKU 数</span><strong>{{ hasPendingSkuLookup ? '待读取' : preview.skuCount }}</strong></div>
-            <div class="preview-items"><div v-for="item in preview.items" :key="item.itemId" class="preview-item"><span class="mono">{{ item.itemId }}</span><span>{{ skuCountLabel(item) }} SKU</span></div><span v-if="!preview.items.length" class="empty-copy">导入后显示商品分组</span></div>
-            <div class="mode-switch"><span>运行模式</span><div class="segmented"><button :class="{ selected: mode === 'demo' }" @click="mode = 'demo'">演练</button><button :class="{ selected: mode === 'live' }" :disabled="!liveRuntimeReady" :title="liveRuntimeMessage" @click="mode = 'live'">线上</button></div></div>
+            <div class="preview-items"><div v-for="item in visiblePreviewItems" :key="item.itemId" class="preview-item"><span class="mono">{{ item.itemId }}</span><span>{{ skuCountLabel(item) }} SKU</span></div><span v-if="!preview.items.length" class="empty-copy">导入后显示商品分组</span><span v-if="hiddenPreviewItemCount" class="preview-overflow-note">仅显示前 {{ PREVIEW_ITEM_LIMIT }} 个商品，另有 {{ hiddenPreviewItemCount }} 个未展开</span></div>
+            <div class="mode-switch"><span>运行模式</span><el-tag type="danger" size="small">线上</el-tag></div>
             <span v-if="!liveRuntimeReady" class="error-line">{{ liveRuntimeMessage }}</span>
-            <div v-if="mode === 'live'" class="live-gate"><CircleAlert :size="16" /><div><strong>线上写入已锁定</strong><p>输入确认词后才能创建批次：<span class="mono">确认线上重建</span></p><el-input v-model="confirmation" placeholder="输入确认词" /></div></div>
-            <button class="primary-button full-button" :disabled="!preview.valid || isSubmitting || (mode === 'live' && (!liveRuntimeReady || confirmation !== '确认线上重建'))" @click="handleCreateBatch"><Play :size="16" />{{ isSubmitting ? '创建中…' : mode === 'demo' ? '创建演练批次' : '创建线上批次' }}</button>
+            <button class="primary-button full-button" :disabled="!preview.valid || isSubmitting || !liveRuntimeReady" @click="handleCreateBatch"><Play :size="16" />{{ isSubmitting ? '创建中…' : '创建线上批次' }}</button>
           </div>
         </div>
       </section>

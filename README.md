@@ -16,7 +16,7 @@ $env:TMALL_DATA_DIR = "$PWD\\.runtime\\tmall-worker"
 npm run worker
 ```
 
-The source worker defaults to **demo mode**. Demo tasks exercise the complete queue, two-phase rebuild state machine, readback, pause/retry, and audit UI without modifying Tmall. The Windows v0.1.10 desktop build enables the reviewed `tmall-publish-v2` pure-HTTP adapter and still requires the exact confirmation phrase `确认线上重建` before a live batch can start.
+The source worker defaults to **demo mode** for automated tests. The Windows v0.1.11 desktop UI exposes only live mode. Creating a batch uses a single explicit confirmation dialog; users no longer select demo mode or type a confirmation phrase.
 
 ## Browser lifecycle
 
@@ -32,7 +32,7 @@ The app still requires Microsoft Edge and WebView2 on Windows. Login is performe
 
 Live execution remains fail-closed. A CAPTCHA/risk page, invalid channel value, local validation error, HTTP/business error, unknown submit response, ID mismatch, or field mismatch moves the task to `needs_manual_review` and is never blindly retried.
 
-Before upgrading, exit the older desktop process so it releases loopback port `19828`. The v0.1.10 UI checks the connected Worker version and disables live mode when an older Worker or an unconfigured contract is still running.
+Before upgrading, exit the older desktop process so it releases loopback port `19828`. The v0.1.11 UI checks the connected Worker version and disables live mode when an older Worker or an unconfigured contract is still running.
 
 ## Verification
 

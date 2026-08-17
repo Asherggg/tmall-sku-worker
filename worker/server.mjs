@@ -14,7 +14,7 @@ const DATA_DIR = process.env.TMALL_DATA_DIR || path.join(__dirname, "..", ".runt
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const CONFIRMATION = "确认线上重建";
 const MANUAL_REVIEW_CONFIRMATION = "确认已人工核对";
-const VERSION = "0.1.10";
+const VERSION = "0.1.11";
 const DEFAULT_LOGIN_URL = "https://myseller.taobao.com/home.htm/QnworkbenchHome/";
 const BROWSER_CDP_PORT = Number(process.env.TMALL_BROWSER_CDP_PORT || PORT + 1);
 

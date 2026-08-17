@@ -12,7 +12,7 @@
 - Both submit phases serialize and validate the intended form before direct HTTP submission.
 - Snapshot, preview, both submits, and readback use the authenticated API request context without page evaluation, events, reloads, or navigation.
 - Malformed bootstrap and canonical mapping failures fail closed without a page-operation fallback.
-- Automated suite: 38/38 passed for v0.1.10.
+- Automated suite: 38/38 passed for v0.1.11.
 
 ## Build
 
@@ -37,4 +37,4 @@ Playwright launched the installed Edge channel headlessly, loaded the console, c
 
 ## Deliberate boundary
 
-The v0.1.10 source enables the versioned `tmall-publish-v2` pure-HTTP executor and supports confirmed resolution of manual-review deletion locks. Unit tests cover the direct submit form contract, XSRF/header handling, absence of page evaluation/events/navigation, channel allowlisting, HTTP-200 business-error classification, unknown-response fail-closed behavior, bootstrap-only readback, exact ID mapping, item-level write locks, semantic SKU comparison, deletion audit behavior, and explicit confirmation before releasing an unresolved write lock. A real live item still requires a separate confirmed acceptance run.
+The v0.1.11 source exposes only live mode in the desktop UI, retains an explicit confirmation dialog without typed confirmation, and limits the expanded batch preview to 10 items. Worker tests continue to cover the direct submit contract, readback, item locks, field comparison, deletion audit behavior, and explicit confirmation before releasing an unresolved write lock.
