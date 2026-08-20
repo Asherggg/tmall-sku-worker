@@ -37,7 +37,7 @@ import {
 import type { BatchRecord, ImportPreview, TaskRecord, WorkerHealth } from "./types";
 
 type View = "overview" | "import" | "queue" | "browser" | "audit";
-const EXPECTED_WORKER_VERSION = "0.1.16";
+const EXPECTED_WORKER_VERSION = "0.1.20";
 const LIVE_CONFIRMATION = "确认线上重建";
 const PREVIEW_ITEM_LIMIT = 10;
 
@@ -58,15 +58,17 @@ const hiddenPreviewItemCount = computed(() => Math.max(0, preview.value.items.le
 const liveRuntimeReady = computed(() => health.value.ready
   && health.value.workerVersion === EXPECTED_WORKER_VERSION
   && health.value.mode === "live"
-  && health.value.contract === "configured");
+  && health.value.contract === "configured"
+  && health.value.inventory?.configured === true
+  && health.value.subsidy?.configured === true);
 const liveRuntimeMessage = computed(() => {
   if (!health.value.ready) return "Worker 未启动，不能执行线上任务";
-  if (health.value.workerVersion !== EXPECTED_WORKER_VERSION) return `当前连接的是旧 Worker ${health.value.workerVersion}，请退出旧版后重新打开 0.1.16`;
-  if (health.value.mode !== "live" || health.value.contract !== "configured") return "当前 Worker 未启用 tmall-publish-v2 纯接口适配器";
+  if (health.value.workerVersion !== EXPECTED_WORKER_VERSION) return `当前连接的是旧 Worker ${health.value.workerVersion}，请退出旧版后重新打开 0.1.20`;
+  if (health.value.mode !== "live" || health.value.contract !== "configured") return "当前 Worker 未完成 OMS、Doris、SKU 重建和国补流程配置";
   return "";
 });
 const hasPendingSkuLookup = computed(() => preview.value.items.some((item) => !item.skuIds.length && item.expectedSkuCount == null));
-const runningTasks = computed(() => tasks.value.filter((task) => ["queued", "reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying"].includes(task.status)));
+const runningTasks = computed(() => tasks.value.filter((task) => ["queued", "oms_preparing", "oms_snapshot", "oms_submitting", "oms_disabled", "inventory_resolving", "reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying", "subsidy_preparing", "subsidy_template_ready", "subsidy_submitting"].includes(task.status)));
 const succeededTasks = computed(() => tasks.value.filter((task) => task.status === "succeeded"));
 const reviewTasks = computed(() => tasks.value.filter((task) => ["needs_manual_review", "failed"].includes(task.status)));
 const activeBatch = computed(() => batches.value.find((batch) => ["queued", "running", "partial"].includes(batch.status)) || batches.value[0]);
@@ -155,7 +157,7 @@ async function handleRetry(task: TaskRecord) {
 }
 
 function canDeleteTask(task: TaskRecord) {
-  return !["reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying"].includes(task.status);
+  return !["oms_preparing", "oms_snapshot", "oms_submitting", "oms_disabled", "inventory_resolving", "reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying", "subsidy_preparing", "subsidy_template_ready", "subsidy_submitting"].includes(task.status);
 }
 
 async function handleDelete(task: TaskRecord) {
@@ -164,7 +166,7 @@ async function handleDelete(task: TaskRecord) {
     return;
   }
   try {
-    const needsManualResolution = task.mode === "live" && task.liveWriteStarted && task.status === "needs_manual_review";
+    const needsManualResolution = task.mode === "live" && (task.liveWriteStarted || task.omsWriteStarted || task.subsidyWriteStarted) && task.status === "needs_manual_review";
     let deletionConfirmation: string | undefined;
     if (needsManualResolution) {
       const result = await ElMessageBox.prompt(
@@ -199,12 +201,12 @@ async function handleDelete(task: TaskRecord) {
   }
 }
 
-async function handleBrowser(action: "login" | "hide" | "verify") {
+async function handleBrowser(action: "login" | "hide" | "verify" | "oms" | "subsidy") {
   try {
     health.value = await browserAction(action);
     if (health.value.riskRequired) ElMessage.warning(health.value.message || "检测到安全验证，请停止重复尝试");
     else if (action === "verify" && !health.value.loggedIn) ElMessage.warning(health.value.message || "尚未验证登录态");
-    else ElMessage.success(action === "login" ? "已打开未附加自动化的专属 Edge" : action === "hide" ? "Edge 保持有头运行，窗口已隐藏" : health.value.webdriver === false ? "登录态有效，webdriver 未开启" : "登录态检查完成");
+    else ElMessage.success(action === "login" ? "已打开未附加自动化的专属 Edge" : action === "oms" ? health.value.message || "已在同一 Profile 打开 OMS 标签页" : action === "subsidy" ? health.value.message || "已在同一 Profile 打开国补标签页" : action === "hide" ? "Edge 保持有头运行，窗口已隐藏" : health.value.message || (health.value.webdriver === false ? "登录态有效，webdriver 未开启" : "登录态检查完成"));
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : "浏览器操作失败");
   }
@@ -228,7 +230,7 @@ async function handleExportAudit() {
 
 function statusLabel(status: TaskRecord["status"]) {
   const labels: Record<TaskRecord["status"], string> = {
-    draft: "草稿", validated: "已校验", planned: "已计划", awaiting_confirmation: "待确认", queued: "排队中", reading_snapshot: "读取快照", temp_submitting: "临时提交", temp_verified: "临时已回读", restoring: "恢复原数据", final_verifying: "最终回读", succeeded: "已完成", paused: "已暂停", needs_manual_review: "人工复核", failed: "失败",
+    draft: "草稿", validated: "已校验", planned: "已计划", awaiting_confirmation: "待确认", queued: "排队中", oms_preparing: "准备 OMS", oms_snapshot: "OMS 快照", oms_submitting: "禁用 OMS", oms_disabled: "OMS 已禁用", inventory_resolving: "查询料号", reading_snapshot: "读取快照", temp_submitting: "临时提交", temp_verified: "临时已回读", restoring: "恢复原数据", final_verifying: "最终回读", subsidy_preparing: "准备国补", subsidy_template_ready: "国补模板", subsidy_submitting: "提交国补", subsidy_verified: "国补已回读", succeeded: "已完成", paused: "已暂停", needs_manual_review: "人工复核", failed: "失败",
   };
   return labels[status];
 }
@@ -350,14 +352,14 @@ onUnmounted(() => {
             <el-table-column label="状态" width="150"><template #default="scope"><el-tag size="small" :type="statusType(scope.row.status)">{{ statusLabel(scope.row.status) }}</el-tag></template></el-table-column>
             <el-table-column label="阶段"><template #default="scope"><span>{{ scope.row.phaseLabel }}</span><small v-if="scope.row.errorMessage" class="error-line">{{ scope.row.errorMessage }}</small></template></el-table-column>
             <el-table-column label="进度" width="170"><template #default="scope"><el-progress :percentage="scope.row.progress" :status="scope.row.status === 'succeeded' ? 'success' : undefined" :stroke-width="6" /></template></el-table-column>
-            <el-table-column label="操作" width="220"><template #default="scope"><div class="row-actions"><button v-if="scope.row.mode === 'demo' && runningTasks.includes(scope.row)" class="table-icon" title="暂停" @click.stop="handlePause(scope.row)"><Pause :size="15" /></button><button v-if="['failed','needs_manual_review'].includes(scope.row.status) && !(scope.row.mode === 'live' && scope.row.liveWriteStarted)" class="table-icon" title="重试" @click.stop="handleRetry(scope.row)"><RotateCcw :size="15" /></button><el-tag v-if="scope.row.mode === 'live' && scope.row.liveWriteStarted && scope.row.status === 'needs_manual_review'" type="danger" size="small">需核对后删除</el-tag><button v-if="canDeleteTask(scope.row)" class="table-icon delete-task-button" title="删除任务" @click.stop="handleDelete(scope.row)"><Trash2 :size="15" /></button><button class="table-icon" title="查看详情" @click.stop="openTask(scope.row)"><ArrowDownToLine :size="15" /></button></div></template></el-table-column>
+            <el-table-column label="操作" width="220"><template #default="scope"><div class="row-actions"><button v-if="scope.row.mode === 'demo' && runningTasks.includes(scope.row)" class="table-icon" title="暂停" @click.stop="handlePause(scope.row)"><Pause :size="15" /></button><button v-if="['failed','needs_manual_review'].includes(scope.row.status) && !(scope.row.mode === 'live' && (scope.row.liveWriteStarted || scope.row.omsWriteStarted || scope.row.subsidyWriteStarted))" class="table-icon" title="重试" @click.stop="handleRetry(scope.row)"><RotateCcw :size="15" /></button><el-tag v-if="scope.row.mode === 'live' && (scope.row.liveWriteStarted || scope.row.omsWriteStarted || scope.row.subsidyWriteStarted) && scope.row.status === 'needs_manual_review'" type="danger" size="small">需核对后删除</el-tag><button v-if="canDeleteTask(scope.row)" class="table-icon delete-task-button" title="删除任务" @click.stop="handleDelete(scope.row)"><Trash2 :size="15" /></button><button class="table-icon" title="查看详情" @click.stop="openTask(scope.row)"><ArrowDownToLine :size="15" /></button></div></template></el-table-column>
           </el-table>
         </div>
       </section>
 
       <section v-else-if="view === 'browser'" class="content-view narrow-view">
         <div class="page-intro"><span class="eyebrow">BROWSER SESSION</span><h2>浏览器登录</h2><p>使用应用专属 Profile，不接管日常 Edge。</p></div>
-        <div class="browser-status panel"><div class="browser-orb" :class="health.loggedIn ? 'online' : ''"><Laptop2 :size="30" /></div><div class="browser-copy"><h3>{{ health.riskRequired ? '需要人工验证' : health.loggedIn ? '会话有效' : '需要登录' }}</h3><p>{{ health.riskRequired ? '已检测到安全验证，当前不会继续尝试' : health.loggedIn ? '专属 Edge 仍以正常有头模式运行' : '登录阶段不附加 Playwright，不切换无头模式' }}</p><div class="status-lines"><span><i :class="['dot', health.loggedIn ? 'ok' : 'warn']" />登录态：{{ health.loggedIn ? '有效' : health.riskRequired ? '验证阻断' : '未验证' }}</span><span><i :class="['dot', health.browser === 'hidden' ? 'ok' : 'muted']" />浏览器：{{ health.browser === 'hidden' ? '窗口已隐藏' : health.browser === 'visible' ? '可见登录' : '未启动' }}</span><span><i class="dot muted" />Profile：<span class="mono">{{ health.profile }}</span></span><span v-if="health.webdriver !== undefined"><i :class="['dot', health.webdriver === false ? 'ok' : 'warn']" />webdriver：{{ health.webdriver === false ? '关闭' : health.webdriver === true ? '开启' : '未知' }}</span></div></div><div class="browser-actions"><button class="primary-button" @click="handleBrowser('login')"><UserRound :size="16" />打开登录窗口</button><button class="outline-button" @click="handleBrowser('verify')"><ShieldCheck :size="16" />我已登录，检查状态</button><button class="ghost-button" @click="handleBrowser('hide')">隐藏窗口</button></div></div>
+        <div class="browser-status panel"><div class="browser-orb" :class="health.loggedIn ? 'online' : ''"><Laptop2 :size="30" /></div><div class="browser-copy"><h3>{{ health.riskRequired ? '需要人工验证' : health.loggedIn ? '会话有效' : '需要登录' }}</h3><p>{{ health.riskRequired ? '已检测到安全验证，当前不会继续尝试' : health.loggedIn ? '专属 Edge 仍以正常有头模式运行' : '登录阶段不附加 Playwright，不切换无头模式' }}</p><div class="status-lines"><span><i :class="['dot', health.loggedIn ? 'ok' : 'warn']" />登录态：{{ health.loggedIn ? '有效' : health.riskRequired ? '验证阻断' : '未验证' }}</span><span><i :class="['dot', health.browser === 'hidden' ? 'ok' : 'muted']" />浏览器：{{ health.browser === 'hidden' ? '窗口已隐藏' : health.browser === 'visible' ? '可见登录' : '未启动' }}</span><span><i class="dot muted" />Profile：<span class="mono">{{ health.profile }}</span></span><span v-if="health.webdriver !== undefined"><i :class="['dot', health.webdriver === false ? 'ok' : 'warn']" />webdriver：{{ health.webdriver === false ? '关闭' : health.webdriver === true ? '开启' : '未知' }}</span><span><i :class="['dot', health.omsLoggedIn ? 'ok' : 'muted']" />OMS：{{ health.omsLoggedIn ? '会话有效' : '未验证' }}</span><span><i :class="['dot', health.subsidyLoggedIn ? 'ok' : 'muted']" />国补页面：{{ health.subsidyLoggedIn ? '会话有效' : '未验证' }}</span></div></div><div class="browser-actions"><button class="primary-button" @click="handleBrowser('login')"><UserRound :size="16" />打开登录窗口</button><button class="outline-button" @click="handleBrowser('oms')">打开 OMS 标签页</button><button class="outline-button" @click="handleBrowser('subsidy')">打开国补标签页</button><button class="outline-button" @click="handleBrowser('verify')"><ShieldCheck :size="16" />检查全部登录</button><button class="ghost-button" @click="handleBrowser('hide')">隐藏窗口</button></div></div>
         <div class="notice-block"><CircleAlert :size="17" /><div><strong>出现连续滑块时请停止重试</strong><p>关闭旧登录页，稍后在新的专属 Profile 中手工完成一次验证；Worker 不会操作滑块。</p></div></div>
       </section>
 

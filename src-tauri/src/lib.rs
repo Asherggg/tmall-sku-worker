@@ -94,9 +94,11 @@ fn spawn_worker(app: &tauri::AppHandle) -> Result<Child, String> {
     let live_contract =
         std::env::var("TMALL_LIVE_CONTRACT").unwrap_or_else(|_| "tmall-publish-v2".to_string());
     let mut command = Command::new(node);
+    let runtime_config = app_data.join("runtime-config.json");
     command
         .arg(script)
-        .env("TMALL_DATA_DIR", app_data)
+        .env("TMALL_DATA_DIR", &app_data)
+        .env("TMALL_RUNTIME_CONFIG", runtime_config)
         .env("TMALL_WORKER_PORT", "19828")
         .env("TMALL_LIVE_ENABLED", live_enabled)
         .env("TMALL_LIVE_CONTRACT", live_contract)

@@ -1,14 +1,14 @@
 {
   "name": "tmall-sku-worker",
   "private": true,
-  "version": "0.1.16",
+  "version": "0.1.20",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "worker": "node worker/server.mjs",
-    "worker:test": "node --test tests/worker.test.mjs tests/import-parser.test.mjs tests/live-adapter.test.mjs",
+    "worker:test": "node --test tests/worker.test.mjs tests/import-parser.test.mjs tests/live-adapter.test.mjs tests/workflow-adapters.test.mjs",
     "test": "npm run worker:test",
     "prepare:runtime": "node scripts/prepare-runtime.mjs",
     "tauri": "tauri",
@@ -19,6 +19,8 @@
     "@lucide/vue": "^1.31.0",
     "@tauri-apps/api": "^2.8.0",
     "element-plus": "^2.11.5",
+    "exceljs": "^4.4.0",
+    "mysql2": "^3.23.3",
     "playwright": "^1.62.1",
     "vue": "^3.5.22"
   },

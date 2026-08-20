@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isLoggedInUrl } from "../worker/browser-url.mjs";
+import { isLoggedInUrl, isOmsSessionReady, isSubsidySessionReady } from "../worker/browser-url.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const port = 19980 + Math.floor(Math.random() * 100);
@@ -86,11 +86,29 @@ test("health starts in safe demo mode", async () => {
   assert.equal(health.webdriver, null);
 });
 
-test("seller workbench and publish pages are recognized as logged in", () => {
+test("seller, OMS, and subsidy login signals are classified without business writes", () => {
   assert.equal(isLoggedInUrl("https://sell.publish.tmall.com/tmall/publish.htm?id=1"), true);
   assert.equal(isLoggedInUrl("https://myseller.taobao.com/home.htm/SellManage/all?current=1"), true);
   assert.equal(isLoggedInUrl("https://myseller.taobao.com/login.htm"), false);
   assert.equal(isLoggedInUrl("https://login.taobao.com/member/login.jhtml"), false);
+  assert.equal(isOmsSessionReady({
+    url: "https://oms.shuixing.com/#/platformCommodity",
+    bodyText: "全渠道订单中心 商品 平台商品 查询",
+    tokenPresent: true,
+  }), true);
+  assert.equal(isOmsSessionReady({
+    url: "https://oms.shuixing.com/#/platformCommodity",
+    bodyText: "全渠道订单中心 商品 平台商品 查询",
+    tokenPresent: false,
+  }), false);
+  assert.equal(isSubsidySessionReady({
+    url: "https://myseller.taobao.com/home.htm/gov-subsidy/goods-manage",
+    bodyText: "国家补贴 商品管理 新增/更新国补商品",
+  }), true);
+  assert.equal(isSubsidySessionReady({
+    url: "https://myseller.taobao.com/home.htm/gov-subsidy/goods-manage?verify=true",
+    bodyText: "安全验证",
+  }), false);
 });
 
 test("demo batch runs item tasks and creates synthetic readback IDs", async () => {

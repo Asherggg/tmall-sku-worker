@@ -6,9 +6,9 @@ const PUBLISH_ORIGIN = "https://sell.publish.tmall.com";
 const VALID_CHANNEL_OPTIONS = new Set(["1", "2"]);
 const PUBLISH_PAGE_PATH = "/tmall/publish.htm";
 const TEMP_READBACK_ATTEMPTS = 6;
-const FINAL_READBACK_ATTEMPTS = 12;
-const READBACK_DELAY_MS = 500;
-const FINAL_READBACK_GRACE_MS = 5_000;
+const FINAL_READBACK_TIMEOUT_MS = 150_000;
+const TEMP_READBACK_DELAY_MS = 500;
+const FINAL_READBACK_DELAY_MS = 2_000;
 
 function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -224,9 +224,16 @@ function canonicalSalePropKeyFromProps(props) {
 
 function canonicalSalePropKey(value) {
   const pairs = String(value || "").split("_").filter(Boolean).map((pair) => {
-    const match = pair.match(/^(\d+)--(-?\d+)$/);
+    const match = pair.match(/^(\d+)(--?)(-?\d+)$/);
     if (!match) throw Object.assign(new Error(`销售属性组合键无效: ${pair || "空"}`), { code: "sale_prop_preview_identity_invalid" });
-    return `${match[1]}--${match[2].replace(/^-/, "")}`;
+    const propertyId = match[1];
+    const separator = match[2];
+    const rawValue = match[3];
+    const valueId = separator === "-" ? rawValue : rawValue.replace(/^-/, "");
+    if (!/^\d+$/.test(valueId)) {
+      throw Object.assign(new Error(`销售属性组合键无效: ${pair || "空"}`), { code: "sale_prop_preview_identity_invalid" });
+    }
+    return `${propertyId}--${valueId}`;
   });
   if (!pairs.length || new Set(pairs).size !== pairs.length) {
     throw Object.assign(new Error("销售属性预检组合键为空或重复"), { code: "sale_prop_preview_identity_invalid" });
@@ -447,6 +454,35 @@ export function summarizeForm(formValues) {
   };
 }
 
+function inventoryMappingFromRow(row, resolved) {
+  return {
+    materialNo: String(resolved?.materialNo ?? row?.skuOuterId ?? "").trim(),
+    barcode: String(resolved?.barcode ?? "").trim(),
+    subMaterialName: String(resolved?.subMaterialName ?? "").trim(),
+    specification: String(resolved?.specification ?? "").trim(),
+  };
+}
+
+function applyInventoryResolution(formValues, resolution) {
+  const rows = activeRows(formValues?.sku);
+  const resolvedRows = Array.isArray(resolution?.rows) ? resolution.rows : Array.isArray(resolution) ? resolution : [];
+  if (resolvedRows.length !== rows.length) {
+    throw Object.assign(new Error(`Doris 返回 ${resolvedRows.length} 条 SKU 资料，预期 ${rows.length} 条`), { code: "inventory_resolution_count_mismatch" });
+  }
+  const mappings = rows.map((row, index) => {
+    const mapping = inventoryMappingFromRow(row, resolvedRows[index]);
+    if (!mapping.materialNo || !mapping.subMaterialName || !mapping.specification) {
+      throw Object.assign(new Error(`SKU ${positiveSkuId(row?.skuId) || index + 1} 缺少料号、品名或规格资料`), { code: "inventory_resolution_incomplete", index });
+    }
+    if (!mapping.barcode && !String(row?.skuBarcode ?? "").trim()) {
+      throw Object.assign(new Error(`SKU ${positiveSkuId(row?.skuId) || index + 1} 缺少可用 69 码`), { code: "inventory_barcode_missing", index, materialNo: mapping.materialNo });
+    }
+    if (!String(row?.skuBarcode ?? "").trim() && mapping.barcode) row.skuBarcode = mapping.barcode;
+    return mapping;
+  });
+  return mappings;
+}
+
 function uniqueToken(task) {
   const suffix = crypto.createHash("sha256").update(`${task.id}:${task.itemId}:${Date.now()}`).digest("hex").slice(0, 10);
   return `TMALL_REBUILD_${suffix}`;
@@ -521,6 +557,18 @@ function buildTemporaryForm(formValues, task, salePropMeta) {
     updated.skuOuterId = `${token}_${index + 1}`;
     updated.skuBarcode = "";
     updated.props = (updated.props || []).map((prop) => prop.name === key ? { ...prop, value: selected.value, text: selected.text } : prop);
+    const skuParamKey = `skuParam_${key}`;
+    const currentSkuParam = updated[skuParamKey];
+    const skuParamMirrorsProp = currentSkuParam && typeof currentSkuParam === "object"
+      && String(currentSkuParam.value ?? "").replace(/^-/, "") === String(currentProp.value ?? "").replace(/^-/, "");
+    if (skuParamMirrorsProp) {
+      const normalizedValue = String(selected.value ?? "").replace(/^-/, "");
+      updated[skuParamKey] = {
+        ...currentSkuParam,
+        value: typeof currentSkuParam.value === "number" ? Number(normalizedValue) : normalizedValue,
+        text: selected.text,
+      };
+    }
     updated.salePropKey = canonicalSalePropKeyFromProps(updated.props);
     return updated;
   });
@@ -610,13 +658,23 @@ async function fetchInitialState(page, baseUrl) {
   };
 }
 
-async function loadReadback(page, baseUrl, fallbackState, phase, accepts) {
-  const startedAt = Date.now();
-  const regularAttempts = phase === "final_readback" ? FINAL_READBACK_ATTEMPTS : TEMP_READBACK_ATTEMPTS;
-  const maxAttempts = regularAttempts + (phase === "final_readback" ? 1 : 0);
+async function loadReadback(page, baseUrl, fallbackState, phase, accepts, timing = {}) {
+  const now = typeof timing.now === "function" ? timing.now : Date.now;
+  const sleep = typeof timing.sleep === "function"
+    ? timing.sleep
+    : (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs));
+  const finalReadbackDelayMs = Number.isFinite(Number(timing.finalDelayMs)) && Number(timing.finalDelayMs) > 0
+    ? Number(timing.finalDelayMs)
+    : FINAL_READBACK_DELAY_MS;
+  const startedAt = now();
+  const finalDeadlineAt = startedAt + FINAL_READBACK_TIMEOUT_MS;
+  const finalPhase = phase === "final_readback";
+  let attempt = 0;
   let lastState = null;
   let lastError = null;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  while (finalPhase || attempt < TEMP_READBACK_ATTEMPTS) {
+    const deadlineReadback = finalPhase && now() >= finalDeadlineAt;
+    attempt += 1;
     try {
       const parsed = await fetchServerReadback(page, baseUrl);
       const salePropMeta = normalizeSalePropMeta(parsed.salePropMeta) || fallbackState?.salePropMeta || [];
@@ -633,10 +691,11 @@ async function loadReadback(page, baseUrl, fallbackState, phase, accepts) {
           method: "GET",
           path: PUBLISH_PAGE_PATH,
           status: parsed.status,
-          durationMs: Date.now() - startedAt,
+          durationMs: now() - startedAt,
           strategy: "api_server_bootstrap",
           attempts: attempt,
           settled: false,
+          ...(finalPhase ? { deadlineMs: FINAL_READBACK_TIMEOUT_MS, deadlineReadback } : {}),
         },
       };
       if (!accepts || accepts(lastState)) {
@@ -646,9 +705,13 @@ async function loadReadback(page, baseUrl, fallbackState, phase, accepts) {
     } catch (error) {
       lastError = error;
     }
-    if (attempt < maxAttempts) {
-      const delay = phase === "final_readback" && attempt === regularAttempts ? FINAL_READBACK_GRACE_MS : READBACK_DELAY_MS;
-      await new Promise((resolve) => setTimeout(resolve, delay));
+    if (finalPhase) {
+      if (deadlineReadback) break;
+      const remainingMs = finalDeadlineAt - now();
+      if (remainingMs > 0) await sleep(Math.min(finalReadbackDelayMs, remainingMs));
+    } else {
+      if (attempt >= TEMP_READBACK_ATTEMPTS) break;
+      await sleep(TEMP_READBACK_DELAY_MS);
     }
   }
   if (lastState) return lastState;
@@ -664,7 +727,7 @@ function customCheckMessage(payload) {
   return typeof first === "object" ? first?.msg || first?.message : first;
 }
 
-async function validateCustomSalePropValues(page, candidate, values, baseUrl) {
+async function validateCustomSalePropValues(page, candidate, values, global, baseUrl) {
   const checkUrl = String(candidate?.meta?.checkUrl || "");
   if (!checkUrl) return [];
   let endpoint;
@@ -676,26 +739,31 @@ async function validateCustomSalePropValues(page, candidate, values, baseUrl) {
     throw Object.assign(new Error("自定义销售属性异步校验地址不在允许范围内"), { code: "sale_prop_custom_check_invalid" });
   }
   const propertyId = String(candidate.meta.propertyId || candidate.key.replace(/^p-/, ""));
+  endpoint.searchParams.set("pid", propertyId);
   const texts = [...new Set((values || []).map((value) => String(value?.text ?? "")).filter(Boolean))];
   const checks = [];
-  for (const keyword of texts) {
-    const url = new URL(endpoint.toString());
-    url.searchParams.set("keyword", keyword);
-    url.searchParams.set("pid", propertyId);
+  for (const text of texts) {
+    const body = new URLSearchParams(endpoint.searchParams);
+    body.set("jsonBody", JSON.stringify({ text }));
+    body.set("globalExtendInfo", String(globalField(global, "globalExtendInfo") ?? ""));
     const startedAt = Date.now();
-    const result = await apiFetch(page, url.toString(), { method: "GET" });
+    const result = await apiFetch(page, endpoint.toString(), { method: "POST", body, headers: { Referer: baseUrl } });
     let payload = null;
     try { payload = JSON.parse(result.text || "{}"); } catch {}
     const globalMessage = payload?.models?.globalMessage || payload?.globalMessage || {};
     const type = String(globalMessage.type || "").toLowerCase();
-    if (result.status < 200 || result.status >= 300 || type === "error" || payload?.success === false) {
-      throw Object.assign(new Error(customCheckMessage(payload) || `自定义销售属性校验失败（HTTP ${result.status}）`), {
-        code: "sale_prop_custom_check_rejected",
+    const rejected = result.status < 200 || result.status >= 300
+      || type === "error" || type === "fail"
+      || payload?.success === false || payload?.data?.success === false;
+    const accepted = type === "success" || payload?.success === true || payload?.data?.success === true;
+    if (rejected || !accepted) {
+      throw Object.assign(new Error(customCheckMessage(payload) || payload?.message || `自定义销售属性校验失败（HTTP ${result.status}）`), {
+        code: rejected ? "sale_prop_custom_check_rejected" : "sale_prop_custom_check_unknown",
         status: result.status,
         propertyId,
       });
     }
-    checks.push({ path: "/tmall/asyncOpt.htm", method: "GET", status: result.status, durationMs: Date.now() - startedAt, businessCode: "SUCCESS" });
+    checks.push({ path: "/tmall/asyncOpt.htm", method: "POST", status: result.status, durationMs: Date.now() - startedAt, businessCode: "SUCCESS" });
   }
   return checks;
 }
@@ -978,6 +1046,20 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   let state = await fetchInitialState(page, baseUrl);
   assertItemIdentity(state, baseUrl, task.itemId);
   const original = clone(state.formValues);
+  let inventoryMappings = activeRows(original.sku).map((row) => inventoryMappingFromRow(row, row));
+  if (typeof hooks.resolveInventory === "function") {
+    let resolution;
+    try {
+      resolution = await hooks.resolveInventory(activeRows(original.sku).map(clone), { itemId: String(task.itemId), requireBarcode: true });
+      inventoryMappings = applyInventoryResolution(original, resolution);
+    } catch (cause) {
+      throw Object.assign(new Error(cause?.message || "Doris SKU 资料解析失败"), { code: cause?.code || "inventory_resolution_failed", cause });
+    }
+    await invokeHook("onInventory", {
+      phase: "resolved",
+      mappings: inventoryMappings.map(({ materialNo, subMaterialName, specification }) => ({ materialNo, subMaterialName, specification })),
+    });
+  }
   const channelOption = normalizeChannelOption(original);
   original.channelOption = channelOption;
   const originalSummary = summarizeForm(original);
@@ -1012,7 +1094,7 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   await reportPhase("reading_snapshot", `已读取商品快照：${originalSummary.skuCount} 个 SKU（${variantLabel}${customCheckLabel}）`, "info", 12);
 
   const temporary = buildTemporaryForm(original, task, state.salePropMeta);
-  const customChecks = await validateCustomSalePropValues(page, temporary, temporary.temporaryValues, baseUrl);
+  const customChecks = await validateCustomSalePropValues(page, temporary, temporary.temporaryValues, state.global, baseUrl);
   for (const check of customChecks) {
     await invokeHook("onNetwork", { phase: "sale_prop_custom_check", ...check });
   }
@@ -1034,7 +1116,7 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
     return summary.skuIds.length === originalSummary.skuCount
       && new Set(summary.skuIds).size === originalSummary.skuCount
       && summary.skuIds.every((skuId) => !oldIds.has(skuId));
-  });
+  }, hooks.readbackTiming);
   await invokeHook("onReadback", state.readback);
   assertItemIdentity(state, baseUrl, task.itemId);
   const temporaryReadback = summarizeForm(state.formValues);
@@ -1067,7 +1149,7 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
       && compareSkuRows(original.sku, candidate.formValues.sku, { ignoreStock: true }).equal
       && compareSaleProps(original.saleProp, candidate.formValues.saleProp)
       && normalizeChannelOption(candidate.formValues).value === channelOption.value;
-  });
+  }, hooks.readbackTiming);
   await invokeHook("onReadback", state.readback);
   assertItemIdentity(state, baseUrl, task.itemId);
   const finalSummary = summarizeForm(state.formValues);
@@ -1085,5 +1167,10 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   }
   await invokeHook("onSnapshot", { phase: "after", summary: finalSummary, comparison });
   await reportPhase("final_verifying", "最终回读一致：原规格字段已恢复且 SKU ID 已更新（库存采用平台实时值）", "success", 100);
-  return { oldSkuIds: originalSummary.skuIds, newSkuIds: finalIds, skuCount: finalSummary.skuCount, detailVariant: originalSummary.detailVariant, comparison, hookErrors };
+  const skuMappings = activeRows(original.sku).map((row, index) => ({
+    oldSkuId: positiveSkuId(row?.skuId),
+    newSkuId: positiveSkuId(generatedIds[index]),
+    ...inventoryMappings[index],
+  }));
+  return { oldSkuIds: originalSummary.skuIds, newSkuIds: finalIds, skuCount: finalSummary.skuCount, detailVariant: originalSummary.detailVariant, comparison, skuMappings, hookErrors };
 }

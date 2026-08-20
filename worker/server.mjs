@@ -4,8 +4,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { isLoggedInUrl } from "./browser-url.mjs";
+import { isLoggedInUrl, isOmsSessionReady, isRiskPage, isSubsidySessionReady } from "./browser-url.mjs";
+import { createInventoryRepository, inventoryHealth, lookupDigest, resolveSkuInventory } from "./inventory-service.mjs";
+import { executeOmsDisable, OMS_PAGE_URL } from "./oms-platform-adapter.mjs";
 import { executeTmallRebuild } from "./tmall-live-adapter.mjs";
+import { executeTmallSubsidy, SUBSIDY_URL } from "./tmall-subsidy-adapter.mjs";
+import { runtimeValue } from "./runtime-config.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.TMALL_WORKER_PORT || 19828);
@@ -14,13 +18,16 @@ const DATA_DIR = process.env.TMALL_DATA_DIR || path.join(__dirname, "..", ".runt
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const CONFIRMATION = "确认线上重建";
 const MANUAL_REVIEW_CONFIRMATION = "确认已人工核对";
-const VERSION = "0.1.16";
+const VERSION = "0.1.20";
 const DEFAULT_LOGIN_URL = "https://myseller.taobao.com/home.htm/QnworkbenchHome/";
+const OMS_LOGIN_URL = OMS_PAGE_URL;
+const SUBSIDY_LOGIN_URL = SUBSIDY_URL;
+const SUBSIDY_ENABLED = String(runtimeValue("TMALL_SUBSIDY_ENABLED") ?? "false").toLowerCase() === "true";
 const BROWSER_CDP_PORT = Number(process.env.TMALL_BROWSER_CDP_PORT || PORT + 1);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const initialState = () => ({ batches: [], tasks: [], audit: [], browser: { visible: false, hidden: false, loggedIn: false, riskRequired: false, webdriver: null, profile: process.env.TMALL_BROWSER_PROFILE || path.join(DATA_DIR, "edge-profile-v2"), strategy: process.platform === "win32" ? "system-edge-cdp" : "playwright" } });
+const initialState = () => ({ batches: [], tasks: [], audit: [], browser: { visible: false, hidden: false, loggedIn: false, omsLoggedIn: false, subsidyLoggedIn: false, riskRequired: false, webdriver: null, profile: process.env.TMALL_BROWSER_PROFILE || path.join(DATA_DIR, "edge-profile-v2"), strategy: process.platform === "win32" ? "system-edge-cdp" : "playwright" } });
 
 function readState() {
   try {
@@ -31,7 +38,7 @@ function readState() {
 }
 
 let state = readState();
-state.browser = { ...initialState().browser, ...state.browser, profile: initialState().browser.profile, visible: false, hidden: false, loggedIn: false };
+state.browser = { ...initialState().browser, ...state.browser, profile: initialState().browser.profile, visible: false, hidden: false, loggedIn: false, omsLoggedIn: false, subsidyLoggedIn: false };
 let activeBatchId = null;
 const pendingRuns = [];
 const scheduledRuns = new Map();
@@ -39,7 +46,10 @@ const runningTaskIds = new Set();
 let browserConnection = null;
 let browserContext = null;
 let browserPage = null;
+let omsPage = null;
+let subsidyPage = null;
 let edgeProcess = null;
+let inventoryRepository = null;
 
 const allowedOrigins = new Set([
   "http://127.0.0.1:5173",
@@ -130,7 +140,7 @@ function validateItems(items) {
 
 function phaseFor(status) {
   return {
-    draft: "待校验", validated: "已校验", planned: "已计划", awaiting_confirmation: "等待线上确认", queued: "排队中", reading_snapshot: "读取商品快照", temp_submitting: "提交临时规格", temp_verified: "回读新 SKU", restoring: "恢复原数据", final_verifying: "最终回读校验", succeeded: "回读一致", paused: "已暂停", needs_manual_review: "待人工复核", failed: "处理失败",
+    draft: "待校验", validated: "已校验", planned: "已计划", awaiting_confirmation: "等待线上确认", queued: "排队中", oms_preparing: "准备 OMS", oms_snapshot: "读取 OMS 快照", oms_submitting: "禁用 OMS 商品", oms_disabled: "OMS 已禁用", inventory_resolving: "查询料号资料", reading_snapshot: "读取商品快照", temp_submitting: "提交临时规格", temp_verified: "回读新 SKU", restoring: "恢复原数据", final_verifying: "最终回读校验", subsidy_preparing: "准备国补模板", subsidy_template_ready: "国补模板已填充", subsidy_submitting: "提交国补商品", subsidy_verified: "国补已回读", succeeded: "回读一致", paused: "已暂停", needs_manual_review: "待人工复核", failed: "处理失败",
   }[status] || status;
 }
 
@@ -138,22 +148,26 @@ function taskResponse(task) {
   return { ...task, timeline: [...task.timeline] };
 }
 
+function externalWriteStarted(task) {
+  return task?.liveWriteStarted === true || task?.omsWriteStarted === true || task?.subsidyWriteStarted === true;
+}
+
 function unresolvedLiveWrite(itemId, exceptTaskId) {
   return state.tasks.find((task) => task.itemId === String(itemId)
     && task.id !== exceptTaskId
-    && task.liveWriteStarted === true
+    && externalWriteStarted(task)
     && task.status !== "succeeded");
 }
 
-const ACTIVE_TASK_STATUSES = new Set(["reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying"]);
+const ACTIVE_TASK_STATUSES = new Set(["oms_preparing", "oms_snapshot", "oms_submitting", "oms_disabled", "inventory_resolving", "reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying", "subsidy_preparing", "subsidy_template_ready", "subsidy_submitting"]);
 
 function taskDeletionError(task, confirmation) {
   if (runningTaskIds.has(task.id) || ACTIVE_TASK_STATUSES.has(task.status)) {
     return "任务正在执行，必须等到当前阶段结束后才能删除";
   }
-  if (task.mode === "live" && task.liveWriteStarted && task.status !== "succeeded") {
+  if (task.mode === "live" && externalWriteStarted(task) && task.status !== "succeeded") {
     if (task.status !== "needs_manual_review" || confirmation !== MANUAL_REVIEW_CONFIRMATION) {
-      return "任务已经进入线上写入阶段；请先人工核对线上商品，再输入确认词解除锁定并删除";
+      return "任务已经进入 OMS、天猫或国补写入阶段；请先人工核对线上状态，再输入确认词解除锁定并删除";
     }
   }
   return null;
@@ -188,6 +202,9 @@ function updateBatchAfterTaskRemoval(batch) {
 function health() {
   const liveEnabled = process.env.TMALL_LIVE_ENABLED === "true";
   const contractConfigured = process.env.TMALL_LIVE_CONTRACT === "tmall-publish-v2";
+  const inventory = inventoryHealth();
+  const subsidyConfigured = !liveEnabled || SUBSIDY_ENABLED;
+  const workflowConfigured = !liveEnabled || (contractConfigured && inventory.configured && subsidyConfigured);
   return {
     ready: true,
     mode: liveEnabled ? "live" : "demo",
@@ -195,11 +212,15 @@ function health() {
     browser: state.browser.visible ? "visible" : state.browser.hidden ? "hidden" : "stopped",
     profile: state.browser.profile,
     loggedIn: state.browser.loggedIn,
+    omsLoggedIn: state.browser.omsLoggedIn,
+    subsidyLoggedIn: state.browser.subsidyLoggedIn,
     riskRequired: state.browser.riskRequired,
     webdriver: state.browser.webdriver,
-    contract: liveEnabled ? (contractConfigured ? "configured" : "missing") : "demo",
-    unresolvedLiveWrites: state.tasks.filter((task) => task.liveWriteStarted === true && task.status !== "succeeded").length,
-    message: liveEnabled && !contractConfigured ? "线上适配器未配置；演练可用，线上写入会进入人工复核" : liveEnabled ? "线上重建适配器已就绪" : undefined,
+    inventory,
+    subsidy: { configured: subsidyConfigured, enabled: SUBSIDY_ENABLED },
+    contract: liveEnabled ? (workflowConfigured ? "configured" : "missing") : "demo",
+    unresolvedLiveWrites: state.tasks.filter((task) => externalWriteStarted(task) && task.status !== "succeeded").length,
+    message: liveEnabled && !workflowConfigured ? "OMS、Doris 或国补流程尚未完成配置；未发出线上写请求" : liveEnabled ? "OMS、Doris、SKU 重建和国补流程已配置" : undefined,
   };
 }
 
@@ -289,6 +310,8 @@ async function ensurePlaywrightBrowser({ visible }) {
     state.browser.loggedIn = isLoggedInUrl(currentUrl);
   }
   if (browserContext) await browserContext.close().catch(() => {});
+  omsPage = null;
+  subsidyPage = null;
   const launchOptions = {
     headless: !visible,
     channel: process.env.TMALL_BROWSER_CHANNEL || "chromium",
@@ -344,9 +367,13 @@ async function openLoginBrowser() {
     browserConnection = null;
     browserContext = null;
     browserPage = null;
+    omsPage = null;
+    subsidyPage = null;
     state.browser.visible = false;
     state.browser.hidden = false;
     state.browser.loggedIn = false;
+    state.browser.omsLoggedIn = false;
+    state.browser.subsidyLoggedIn = false;
     state.browser.riskRequired = false;
     state.browser.webdriver = null;
     saveState();
@@ -371,9 +398,13 @@ async function connectSystemEdge() {
       browserConnection = null;
       browserContext = null;
       browserPage = null;
+      omsPage = null;
+      subsidyPage = null;
       state.browser.visible = false;
       state.browser.hidden = false;
       state.browser.loggedIn = false;
+      state.browser.omsLoggedIn = false;
+      state.browser.subsidyLoggedIn = false;
       state.browser.riskRequired = false;
       state.browser.webdriver = null;
       saveState();
@@ -385,20 +416,100 @@ async function connectSystemEdge() {
   return browserPage;
 }
 
+function pageIsUsable(page) {
+  return Boolean(page && !page.isClosed?.());
+}
+
+function findPageByHost(hostname) {
+  if (!browserConnection) return null;
+  const pages = browserConnection.contexts().flatMap((context) => context.pages());
+  return pages.find((page) => {
+    try { return new URL(page.url()).hostname === hostname; } catch { return false; }
+  }) || null;
+}
+
+async function openTargetPage(targetUrl, target, { reveal = false } = {}) {
+  if (state.browser.strategy === "system-edge-cdp") await connectSystemEdge();
+  if (!browserContext) throw Object.assign(new Error("专属浏览器上下文不可用"), { code: "browser_context_unavailable" });
+  const hostname = new URL(targetUrl).hostname;
+  let page = target === "oms" ? omsPage : target === "subsidy" ? subsidyPage : null;
+  if (!pageIsUsable(page)) page = findPageByHost(hostname);
+  if (!pageIsUsable(page)) page = await browserContext.newPage();
+  if (!page.url() || page.url() === "about:blank" || !page.url().startsWith(targetUrl)) {
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => {});
+  }
+  if (target === "oms") omsPage = page;
+  if (target === "subsidy") subsidyPage = page;
+  if (reveal && state.browser.strategy === "system-edge-cdp" && !state.browser.visible) {
+    setEdgeWindowVisible(true);
+    state.browser.visible = true;
+    state.browser.hidden = false;
+  }
+  saveState();
+  return page;
+}
+
+async function ensureOmsPage() {
+  if (state.browser.strategy === "system-edge-cdp") await connectSystemEdge();
+  return openTargetPage(OMS_LOGIN_URL, "oms");
+}
+
+async function ensureSubsidyPage() {
+  if (state.browser.strategy === "system-edge-cdp") await connectSystemEdge();
+  return openTargetPage(SUBSIDY_LOGIN_URL, "subsidy");
+}
+
+async function inspectBrowserPage(page) {
+  if (!pageIsUsable(page)) return { url: "", bodyText: "", webdriver: null, tokenPresent: false };
+  const url = page.url();
+  return page.evaluate(() => ({
+    bodyText: (document.body?.innerText || "").slice(0, 12000),
+    webdriver: navigator.webdriver,
+    tokenPresent: Boolean(localStorage.getItem("token")),
+  })).then((signals) => ({ url, ...signals })).catch(() => ({ url, bodyText: "", webdriver: null, tokenPresent: false }));
+}
+
 async function verifyBrowser() {
   if (state.browser.strategy === "system-edge-cdp") await connectSystemEdge();
-  if (!browserPage) return { ...health(), message: "未找到专属浏览器页面" };
-  const url = browserPage.url();
-  const signals = await browserPage.evaluate(() => ({
-    webdriver: navigator.webdriver,
-    riskRequired: /请.*拖动.*滑块|按住.*滑块|安全验证|请完成下方验证|验证中心/.test((document.body?.innerText || "").slice(0, 12000)),
-  })).catch(() => ({ webdriver: null, riskRequired: false }));
-  const riskRequired = signals.riskRequired || /captcha|punish|risk|secverify/i.test(url);
+  if (!browserConnection && !browserContext) return { ...health(), message: "未找到专属浏览器页面" };
+  const pages = browserConnection
+    ? browserConnection.contexts().flatMap((context) => context.pages())
+    : browserContext?.pages?.() || [];
+  const sellerPage = pages.find((page) => isLoggedInUrl(page.url())) || browserPage;
+  const omsCandidate = pages.find((page) => {
+    try { return new URL(page.url()).hostname === "oms.shuixing.com"; } catch { return false; }
+  });
+  const subsidyCandidate = pages.find((page) => {
+    try {
+      const parsed = new URL(page.url());
+      return parsed.hostname === "myseller.taobao.com" && parsed.pathname === "/home.htm/gov-subsidy/goods-manage";
+    } catch { return false; }
+  });
+  const [sellerSignals, omsSignals, subsidySignals] = await Promise.all([
+    inspectBrowserPage(sellerPage),
+    inspectBrowserPage(omsCandidate),
+    inspectBrowserPage(subsidyCandidate),
+  ]);
+  const riskRequired = isRiskPage(sellerSignals.url, sellerSignals.bodyText)
+    || isRiskPage(omsSignals.url, omsSignals.bodyText) || isRiskPage(subsidySignals.url, subsidySignals.bodyText);
+  browserPage = sellerPage || browserPage;
+  omsPage = omsCandidate || null;
+  subsidyPage = subsidyCandidate || null;
   state.browser.riskRequired = riskRequired;
-  state.browser.webdriver = signals.webdriver;
-  state.browser.loggedIn = !riskRequired && isLoggedInUrl(url);
+  state.browser.webdriver = sellerSignals.webdriver;
+  state.browser.loggedIn = !riskRequired && isLoggedInUrl(sellerSignals.url);
+  state.browser.omsLoggedIn = !riskRequired && isOmsSessionReady(omsSignals);
+  state.browser.subsidyLoggedIn = !riskRequired && isSubsidySessionReady(subsidySignals);
   saveState();
-  return { ...health(), currentUrl: url, webdriver: signals.webdriver, message: riskRequired ? "检测到安全验证；请停止重复尝试，稍后手工处理" : state.browser.loggedIn ? "登录态已验证" : "尚未通过登录或当前仍在验证页面" };
+  const verifiedCount = [state.browser.loggedIn, state.browser.omsLoggedIn, state.browser.subsidyLoggedIn].filter(Boolean).length;
+  return {
+    ...health(),
+    currentUrl: sellerSignals.url,
+    webdriver: sellerSignals.webdriver,
+    message: riskRequired
+      ? "检测到安全验证；请停止重复尝试，稍后手工处理"
+      : `登录检查完成：淘宝${state.browser.loggedIn ? "有效" : "未验证"}，OMS${state.browser.omsLoggedIn ? "有效" : "未验证"}，国补${state.browser.subsidyLoggedIn ? "有效" : "未验证"}（${verifiedCount}/3）`,
+  };
 }
 
 async function hideBrowserWindow() {
@@ -458,14 +569,23 @@ async function runDemoTask(task) {
   saveState();
 }
 
+function getInventoryRepository() {
+  if (!inventoryRepository) inventoryRepository = createInventoryRepository();
+  return inventoryRepository;
+}
+
 async function runLiveTask(task) {
-  if (process.env.TMALL_LIVE_ENABLED !== "true" || process.env.TMALL_LIVE_CONTRACT !== "tmall-publish-v2") {
+  const inventory = inventoryHealth();
+  if (process.env.TMALL_LIVE_ENABLED !== "true"
+    || process.env.TMALL_LIVE_CONTRACT !== "tmall-publish-v2"
+    || !inventory.configured
+    || !SUBSIDY_ENABLED) {
     task.status = "needs_manual_review";
-    task.errorCode = "adapter_contract_missing";
-    task.errorMessage = "线上适配器契约未配置，未发出任何写请求";
+    task.errorCode = "workflow_contract_missing";
+    task.errorMessage = "OMS、Doris、SKU 重建和国补流程尚未全部配置，未发出任何写请求";
     task.progress = 0;
     addTimeline(task, "needs_manual_review", task.errorMessage, "warning");
-    addAudit(task, "blocked", { method: "BLOCKED", path: "worker://live-adapter", businessCode: task.errorCode });
+    addAudit(task, "blocked", { method: "BLOCKED", path: "worker://workflow-contract", businessCode: task.errorCode });
     saveState();
     return;
   }
@@ -476,12 +596,52 @@ async function runLiveTask(task) {
     }
     const page = await connectSystemEdge();
     if (!page) throw Object.assign(new Error("未找到专属 Edge 商品页"), { code: "browser_page_unavailable" });
+    const phase = (entry, adapterPath) => {
+      task.status = entry.phase;
+      if (entry.progress != null) task.progress = entry.progress;
+      addTimeline(task, entry.phase, entry.message, entry.level);
+      addAudit(task, entry.phase, { method: "LOCAL", path: adapterPath });
+      saveState();
+    };
+    const oms = await executeOmsDisable(await ensureOmsPage(), task.itemId, {
+      onPhase(entry) { phase(entry, "worker://oms-platform-adapter"); },
+      onWriteStart(entry) {
+        task.omsWriteStarted = true;
+        task.writePhase = entry.phase;
+        saveState();
+      },
+      onNetwork(entry) {
+        addAudit(task, entry.phase, { method: entry.method, path: entry.path, status: entry.status, businessCode: entry.classification?.businessCode });
+        saveState();
+      },
+      onReadback(entry) {
+        task.omsReadback = { phase: entry.phase, recordCount: entry.recordCount };
+        addAudit(task, entry.phase, { method: entry.method, path: entry.path, status: entry.status, businessCode: "SUCCESS" });
+        saveState();
+      },
+    });
+    state.browser.omsLoggedIn = true;
+    task.omsSnapshot = { recordCount: oms.recordCount, changedRecordIds: oms.changedRecordIds };
+    addTimeline(task, "oms_disabled", `OMS 已确认禁用 ${oms.recordCount} 条商品记录`, "success");
+    saveState();
+
     const result = await executeTmallRebuild(page, task, {
-      onPhase(entry) {
-        task.status = entry.phase;
-        if (entry.progress != null) task.progress = entry.progress;
-        addTimeline(task, entry.phase, entry.message, entry.level);
-        addAudit(task, entry.phase, { method: "LOCAL", path: "worker://tmall-live-adapter" });
+      resolveInventory(rows) {
+        task.status = "inventory_resolving";
+        task.phaseLabel = "正在按料号查询 69 码、品名和规格";
+        task.progress = 20;
+        saveState();
+        return resolveSkuInventory(rows, getInventoryRepository(), { requireBarcode: false }).then((resolved) => {
+          task.inventoryDigest = lookupDigest(resolved.records);
+          task.inventoryMappings = resolved.rows.map(({ materialNo, barcode, subMaterialName, specification }) => ({ materialNo, barcode, subMaterialName, specification }));
+          addAudit(task, "inventory_resolved", { method: "POST", path: "worker://inventory/lookup", status: 200, businessCode: "SUCCESS" });
+          saveState();
+          return resolved;
+        });
+      },
+      onPhase(entry) { phase(entry, "worker://tmall-live-adapter"); },
+      onInventory(entry) {
+        task.inventoryMappings = entry.mappings;
         saveState();
       },
       onSnapshot(entry) {
@@ -509,7 +669,7 @@ async function runLiveTask(task) {
         saveState();
       },
       onNetwork(entry) {
-        addAudit(task, entry.phase, { method: entry.method, path: entry.path, status: entry.status, businessCode: entry.classification.businessCode });
+        addAudit(task, entry.phase, { method: entry.method, path: entry.path, status: entry.status, businessCode: entry.classification?.businessCode });
         saveState();
       },
       onReadback(entry) {
@@ -527,19 +687,31 @@ async function runLiveTask(task) {
     });
     task.oldSkuIds = result.oldSkuIds;
     task.newSkuIds = result.newSkuIds;
+    task.skuMappings = result.skuMappings;
+
+    const subsidy = await executeTmallSubsidy(await ensureSubsidyPage(), task, result.skuMappings, {
+      onPhase(entry) { phase(entry, "worker://tmall-subsidy-adapter"); },
+      onWriteStart(entry) {
+        task.subsidyWriteStarted = true;
+        task.writePhase = entry.phase;
+        saveState();
+      },
+    }, { dataDir: DATA_DIR });
+    state.browser.subsidyLoggedIn = true;
+    task.subsidy = { matchedRows: subsidy.matchedRows, workbookSha256: subsidy.workbookSha256 };
     task.status = "succeeded";
     task.progress = 100;
     task.errorCode = undefined;
     task.errorMessage = undefined;
-    addTimeline(task, "final_verified", `线上重建完成：${result.skuCount} 个 SKU 已生成新 ID，业务字段回读一致（库存采用平台实时值）`, "success");
+    addTimeline(task, "succeeded", `OMS 已禁用，${result.skuCount} 个 SKU 重建并回读一致，国补模板已提交`, "success");
     addAudit(task, "final_verified", { method: "GET", path: "/tmall/publish.htm", status: 200, businessCode: "SUCCESS" });
     saveState();
   } catch (error) {
     task.status = "needs_manual_review";
-    task.errorCode = error.code || "live_rebuild_failed";
-    task.errorMessage = error.message || "线上重建未能确认成功";
+    task.errorCode = error.code || "live_workflow_failed";
+    task.errorMessage = error.message || "线上流程未能确认成功";
     addTimeline(task, "needs_manual_review", `${task.errorMessage}。不会自动重试未知写入`, "error");
-    addAudit(task, "blocked", { method: "BLOCKED", path: "worker://tmall-live-adapter", status: error.status, businessCode: error.businessCode || task.errorCode });
+    addAudit(task, "blocked", { method: "BLOCKED", path: "worker://live-workflow", status: error.status, businessCode: error.businessCode || task.errorCode });
     saveState();
   }
 }
@@ -569,10 +741,10 @@ async function runBatch(batch, selectedTaskIds = batch.taskIds) {
         saveState();
         continue;
       }
-      if (task.mode === "live" && task.liveWriteStarted) {
+      if (task.mode === "live" && externalWriteStarted(task)) {
         task.status = "needs_manual_review";
         task.errorCode = "manual_recovery_required";
-        task.errorMessage = "任务已进入过写入阶段，禁止自动重跑；请先核对服务端状态";
+        task.errorMessage = "任务已进入过 OMS、天猫或国补写入阶段，禁止自动重跑；请先核对服务端状态";
         addTimeline(task, "needs_manual_review", task.errorMessage, "warning");
         saveState();
         continue;
@@ -635,6 +807,15 @@ async function route(request, response) {
     if (request.method === "GET" && pathname === "/tasks") return json(response, 200, { tasks: state.tasks.map(taskResponse) }, rid);
     if (request.method === "GET" && pathname === "/batches") return json(response, 200, { batches: state.batches }, rid);
     if (request.method === "GET" && pathname === "/audit/export") return json(response, 200, { exportedAt: now(), records: state.audit }, rid);
+    if (request.method === "GET" && pathname === "/inventory/health") return json(response, 200, inventoryHealth(), rid);
+    if (request.method === "POST" && pathname === "/inventory/lookup") {
+      const payload = await body(request);
+      const materialNos = Array.isArray(payload.materialNos) ? payload.materialNos.map(String) : [];
+      if (!materialNos.length || materialNos.length > 500) return json(response, 400, { error: "inventory_materials_invalid", message: "materialNos 需要是 1-500 个料号" }, rid);
+      const repository = getInventoryRepository();
+      const rows = await repository.lookup(materialNos);
+      return json(response, 200, { records: rows, digest: lookupDigest(rows) }, rid);
+    }
     if (request.method === "GET" && /^\/tasks\/[^/]+$/.test(pathname)) {
       const task = state.tasks.find((entry) => entry.id === pathname.split("/")[2]);
       return task ? json(response, 200, taskResponse(task), rid) : json(response, 404, { error: "task_not_found" }, rid);
@@ -644,7 +825,7 @@ async function route(request, response) {
       const task = state.tasks.find((entry) => entry.id === taskId);
       if (!task) return json(response, 404, { error: "task_not_found" }, rid);
       const payload = await body(request);
-      const manuallyResolved = Boolean(task.mode === "live" && task.liveWriteStarted && task.status === "needs_manual_review");
+      const manuallyResolved = Boolean(task.mode === "live" && externalWriteStarted(task) && task.status === "needs_manual_review");
       const deletionError = taskDeletionError(task, payload.confirmation);
       if (deletionError) return json(response, 409, { error: manuallyResolved ? "manual_review_confirmation_required" : "task_not_deletable", message: deletionError }, rid);
       const batch = state.batches.find((entry) => entry.id === task.batchId);
@@ -707,7 +888,7 @@ async function route(request, response) {
         const conflicts = batch.taskIds
           .map((taskId) => state.tasks.find((task) => task.id === taskId))
           .filter(Boolean)
-          .filter((task) => (task.liveWriteStarted === true && task.status !== "succeeded") || unresolvedLiveWrite(task.itemId, task.id));
+          .filter((task) => (externalWriteStarted(task) && task.status !== "succeeded") || unresolvedLiveWrite(task.itemId, task.id));
         if (conflicts.length) {
           return json(response, 409, {
             error: "item_write_unresolved",
@@ -732,7 +913,7 @@ async function route(request, response) {
         addTimeline(task, "pause_requested", "已请求在下一个安全边界暂停", "warning");
       } else {
         if (!["failed", "needs_manual_review", "paused"].includes(task.status)) return json(response, 409, { error: "task_not_retryable" }, rid);
-        if (task.mode === "live" && task.liveWriteStarted) return json(response, 409, { error: "manual_recovery_required", message: "任务已进入过写入阶段，禁止自动重跑；请先核对服务端状态" }, rid);
+        if (task.mode === "live" && externalWriteStarted(task)) return json(response, 409, { error: "manual_recovery_required", message: "任务已进入过 OMS、天猫或国补写入阶段，禁止自动重跑；请先核对服务端状态" }, rid);
         if (task.mode === "live" && unresolvedLiveWrite(task.itemId, task.id)) return json(response, 409, { error: "item_write_unresolved", message: "同商品存在未确认的线上写入，禁止重试" }, rid);
         task.status = "queued";
         task.errorCode = undefined;
@@ -752,6 +933,18 @@ async function route(request, response) {
       const result = await openLoginBrowser();
       return json(response, 200, result, rid);
     }
+    if (request.method === "POST" && pathname === "/browser/oms") {
+      await openLoginBrowser();
+      const page = await openTargetPage(OMS_LOGIN_URL, "oms", { reveal: true });
+      const result = await verifyBrowser();
+      return json(response, 200, { ...result, currentUrl: page.url(), message: result.omsLoggedIn ? "OMS 会话已验证" : "请在同一专属 Edge 标签页完成 OMS 登录/验证；Worker 不会填写账号密码" }, rid);
+    }
+    if (request.method === "POST" && pathname === "/browser/subsidy") {
+      await openLoginBrowser();
+      const page = await openTargetPage(SUBSIDY_LOGIN_URL, "subsidy", { reveal: true });
+      const result = await verifyBrowser();
+      return json(response, 200, { ...result, currentUrl: page.url(), message: result.subsidyLoggedIn ? "国补页面会话已验证" : "请在同一专属 Edge 标签页完成淘宝登录/验证" }, rid);
+    }
     if (request.method === "POST" && pathname === "/browser/hide") {
       const result = await hideBrowserWindow();
       return json(response, 200, result, rid);
@@ -770,6 +963,7 @@ server.listen(PORT, HOST, () => console.log(JSON.stringify({ ready: true, url: `
 function shutdown() {
   server.close(() => process.exit(0));
   if (state.browser.strategy === "playwright") browserContext?.close().catch(() => {});
+  inventoryRepository?.close().catch(() => {});
   setTimeout(() => process.exit(0), 500).unref();
 }
 process.on("SIGINT", shutdown);

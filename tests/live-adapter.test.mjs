@@ -178,11 +178,16 @@ class MockTmallPage {
       }
       return this.#response(url, 200, html);
     }
-    if (method === "GET" && parsedUrl.pathname === "/tmall/asyncOpt.htm" && parsedUrl.searchParams.get("optType") === "tmall_new_check_custom_color") {
+    if (method === "POST" && parsedUrl.pathname === "/tmall/asyncOpt.htm" && parsedUrl.searchParams.get("optType") === "tmall_new_check_custom_color") {
+      const body = new URLSearchParams(init.data);
+      const payload = JSON.parse(body.get("jsonBody"));
+      if (!payload?.text || !body.get("globalExtendInfo")) {
+        return this.#response(url, 200, JSON.stringify({ models: { globalMessage: { type: "error", message: [{ code: "PUB_REQUEST_PARAM_INVALID", msg: "参数不能为空" }] } } }));
+      }
       if (this.options.customCheckError) {
         return this.#response(url, 200, JSON.stringify({ models: { globalMessage: { type: "error", message: [{ msg: this.options.customCheckError }] } } }));
       }
-      return this.#response(url, 200, JSON.stringify({ models: { globalMessage: { type: "success" } } }));
+      return this.#response(url, 200, JSON.stringify({ success: true, data: { level: 5 } }));
     }
     if (method === "POST" && parsedUrl.pathname === "/tmall/asyncOpt.htm") return this.#previewResponse(init, url);
     if (method === "POST" && parsedUrl.pathname === "/tmall/submit.htm") {
@@ -194,8 +199,11 @@ class MockTmallPage {
 
   #previewResponse(init, url) {
     const values = JSON.parse(new URLSearchParams(init.data).get("jsonBody"));
+    const formatPreviewKey = this.options.singleDashPreviewKey
+      ? (key) => key.split("_").map((pair) => pair.replace(/^(\d+)--(?=\d+$)/, "$1-")).join("_")
+      : (key) => key;
     let rows = values.sku.map((row) => ({
-      salePropKey: salePropKey(row.props),
+      salePropKey: formatPreviewKey(salePropKey(row.props)),
       skuId: 0,
       skuPicture: null,
       skuTitle: null,
@@ -356,6 +364,22 @@ test("detects SKU-detail pages and preserves required skuParam fields", async ()
   assert.ok(page.submittedForms.every((submitted) => submitted.sku.every((row) => row["skuParam_p-5569827"])));
 });
 
+test("SKU-detail temporary identities keep props and skuParam fields aligned", async () => {
+  const form = makeForm();
+  for (const row of form.sku) {
+    row["skuParam_p-1627207"] = { text: row.props[1].text, value: Number(String(row.props[1].value).replace(/^-/, "")) };
+  }
+  const page = new MockTmallPage(form, { requiresSkuParam: true, singleDashPreviewKey: true });
+  await executeTmallRebuild(page, task());
+  const temporaryRows = page.submittedForms[0].sku;
+  assert.ok(temporaryRows.every((row) => {
+    const prop = row.props.find((entry) => entry.name === "p-1627207");
+    const param = row["skuParam_p-1627207"];
+    return String(param.value) === String(prop.value).replace(/^-/, "") && param.text === prop.text;
+  }));
+  assert.deepEqual(page.submittedForms[1].sku.map((row) => row["skuParam_p-1627207"]), form.sku.map((row) => row["skuParam_p-1627207"]));
+});
+
 test("pure API two-phase rebuild matches reversed preview rows without page navigation", async () => {
   const page = new MockTmallPage();
   const result = await executeTmallRebuild(page, task());
@@ -448,17 +472,55 @@ test("final verification accepts platform inventory drift while retaining all ot
   assert.equal(page.serverForm.sku.some((row, index) => Number(row.skuStock) !== Number(makeForm().sku[index]?.skuStock)), true);
 });
 
-test("final readback waits beyond the temporary window for eventual consistency", async () => {
+test("final readback accepts platform convergence at 109 seconds within the 150-second deadline", async () => {
+  let clock = 0;
+  const readbacks = [];
   const page = new MockTmallPage(makeForm(), {
     fastReadbackHtml(form, salePropMeta, itemId, context) {
       const stale = clone(form);
-      if (context.submitCount === 2 && context.getCount < 15) stale.sku[0].skuTitle = "平台仍在收敛";
+      if (context.submitCount === 2 && clock < 109_000) stale.sku[0].skuTitle = "平台仍在收敛";
       return bootstrapHtml(stale, salePropMeta, itemId);
     },
   });
-  const result = await executeTmallRebuild(page, task());
+  const result = await executeTmallRebuild(page, task(), {
+    readbackTiming: {
+      now: () => clock,
+      sleep: async (delayMs) => { clock += delayMs; },
+      finalDelayMs: 10_000,
+    },
+    onReadback(entry) { readbacks.push(entry); },
+  });
+  const finalReadback = readbacks.find((entry) => entry.phase === "final_readback");
   assert.equal(result.comparison.equal, true);
-  assert.ok(page.getCount >= 15);
+  assert.equal(page.submitCount, 2);
+  assert.equal(finalReadback.settled, true);
+  assert.equal(finalReadback.deadlineMs, 150_000);
+  assert.ok(finalReadback.durationMs >= 109_000 && finalReadback.durationMs < 150_000);
+});
+
+test("final readback performs one fresh GET at the 150-second deadline before manual review", async () => {
+  let clock = 0;
+  const readbacks = [];
+  const page = new MockTmallPage(makeForm(), {
+    fastReadbackHtml(form, salePropMeta, itemId, context) {
+      const stale = clone(form);
+      if (context.submitCount === 2) stale.sku[0].skuTitle = "平台仍在收敛";
+      return bootstrapHtml(stale, salePropMeta, itemId);
+    },
+  });
+  await assert.rejects(executeTmallRebuild(page, task(), {
+    readbackTiming: {
+      now: () => clock,
+      sleep: async (delayMs) => { clock += delayMs; },
+      finalDelayMs: 40_000,
+    },
+    onReadback(entry) { readbacks.push(entry); },
+  }), (error) => error.code === "final_field_mismatch");
+  const finalReadback = readbacks.find((entry) => entry.phase === "final_readback");
+  assert.equal(page.submitCount, 2);
+  assert.equal(finalReadback.settled, false);
+  assert.equal(finalReadback.durationMs, 150_000);
+  assert.equal(finalReadback.deadlineReadback, true);
 });
 
 test("malformed API bootstrap readback fails closed without page fallback", async () => {
@@ -537,8 +599,12 @@ test("a custom property with checkUrl runs the page-compatible async validation 
   assert.equal(result.skuCount, 2);
   const checks = page.apiCalls.filter((entry) => new URL(entry.url).searchParams.get("optType") === "tmall_new_check_custom_color");
   assert.equal(checks.length, 2);
-  assert.ok(checks.every((entry) => typeof entry.url === "string"));
+  assert.ok(checks.every((entry) => entry.method === "POST"));
   assert.ok(checks.every((entry) => new URL(entry.url).searchParams.get("pid") === "1627207"));
+  assert.ok(checks.every((entry) => {
+    const body = new URLSearchParams(entry.body);
+    return JSON.parse(body.get("jsonBody"))?.text && body.get("globalExtendInfo") === "{\"mock\":true}";
+  }));
   assert.equal(page.submitCount, 2);
 });
 
@@ -555,6 +621,17 @@ test("custom property validation errors stop before any write", async () => {
   });
   await assert.rejects(executeTmallRebuild(page, task()), (error) => error.code === "sale_prop_custom_check_rejected");
   assert.equal(page.submitCount, 0);
+});
+
+test("preview accepts the alternate single-dash key used by SKU-detail pages", async () => {
+  const form = makeForm();
+  for (const row of form.sku) {
+    row["skuParam_p-1627207"] = { text: row.props[1].text, value: String(row.props[1].value).replace(/^-/, "") };
+  }
+  const page = new MockTmallPage(form, { singleDashPreviewKey: true, requiresSkuParam: true });
+  const result = await executeTmallRebuild(page, task());
+  assert.equal(result.skuCount, 2);
+  assert.equal(page.submitCount, 2);
 });
 
 test("preview rows cannot fall back to array position when a salePropKey is missing", async () => {
