@@ -16,7 +16,7 @@ $env:TMALL_DATA_DIR = "$PWD\\.runtime\\tmall-worker"
 npm run worker
 ```
 
-The source worker defaults to **demo mode** for automated tests. The Windows v0.1.20 desktop UI exposes only live mode. A live item runs through OMS disablement, Doris material lookup, the two-phase SKU rebuild, and the guarded subsidy-template submission. Creating a batch uses a single explicit confirmation dialog; users no longer select demo mode or type a confirmation phrase. Batch preview shows at most 10 products inside a fixed-height scroll area. Final SKU equivalence excludes live inventory because Tmall inventory can change independently during rebuild.
+The source worker defaults to **demo mode** for automated tests. The Windows v0.1.21 desktop UI exposes only live mode. A live item runs through OMS disablement, Doris material lookup, the two-phase SKU rebuild, and the guarded subsidy-template submission. The subsidy adapter defaults to authenticated MTop/OSS HTTP requests through the logged-in Edge context and retains `TMALL_SUBSIDY_TRANSPORT=page` as an explicit fallback. Creating a batch uses a single explicit confirmation dialog; users no longer select demo mode or type a confirmation phrase. Batch preview shows at most 10 products inside a fixed-height scroll area. Final SKU equivalence excludes live inventory because Tmall inventory can change independently during rebuild.
 
 ## Browser lifecycle
 
@@ -32,7 +32,7 @@ The app still requires Microsoft Edge and WebView2 on Windows. Login is performe
 
 Live execution remains fail-closed. A CAPTCHA/risk page, invalid channel value, local validation error, HTTP/business error, unknown submit response, ID mismatch, or field mismatch moves the task to `needs_manual_review` and is never blindly retried.
 
-Before upgrading, exit the older desktop process so it releases loopback port `19828`. The v0.1.20 UI checks the connected Worker version and disables live mode when an older Worker, missing Doris configuration, or disabled subsidy contract is still running. Runtime workflow settings are read from the app data file `runtime-config.json`, so they do not depend on the environment inherited by Explorer. See [the v0.1.20 release notes](docs/release/0.1.20.md) for the subsidy page contract, final-readback deadline, login verification, remote inventory API configuration, and environment variables.
+Before upgrading, exit the older desktop process so it releases loopback port `19828`. The v0.1.21 UI checks the connected Worker version and disables live mode when an older Worker, missing Doris configuration, or disabled subsidy contract is still running. Runtime workflow settings are read from the app data file `runtime-config.json`, so they do not depend on the environment inherited by Explorer. See [the v0.1.21 release notes](docs/release/0.1.21.md) for the authenticated subsidy API contract, verified live import and readback evidence, and fallback mode.
 
 ## Verification
 

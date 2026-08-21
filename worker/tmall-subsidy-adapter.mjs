@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fillSubsidyWorkbookFile } from "./subsidy-workbook.mjs";
+import { executeTmallSubsidyApi } from "./subsidy-api-adapter.mjs";
+import { runtimeValue } from "./runtime-config.mjs";
 
 export const SUBSIDY_URL = "https://myseller.taobao.com/home.htm/gov-subsidy/goods-manage";
 const SUCCESS_MARKERS = /提交成功|上传成功|保存成功|操作成功|已生效/;
@@ -126,7 +128,7 @@ function selectorsFromEnv() {
   }
 }
 
-export async function executeTmallSubsidy(page, task, skuMappings, hooks = {}, options = {}) {
+async function executeTmallSubsidyPage(page, task, skuMappings, hooks = {}, options = {}) {
   if (!page || page.isClosed?.()) throw error("国补页面不可用", "subsidy_page_unavailable");
   if (!Array.isArray(skuMappings) || !skuMappings.length) throw error("国补流程缺少 SKU 映射", "subsidy_mapping_empty");
   const selectors = { ...selectorsFromEnv(), ...(options.selectors || {}) };
@@ -190,4 +192,11 @@ export async function executeTmallSubsidy(page, task, skuMappings, hooks = {}, o
     matchedRows: filled.matchedRows,
     workbookSha256: filled.sha256,
   };
+}
+
+export async function executeTmallSubsidy(page, task, skuMappings, hooks = {}, options = {}) {
+  const transport = options.transport || runtimeValue("TMALL_SUBSIDY_TRANSPORT") || "api";
+  if (transport === "page") return executeTmallSubsidyPage(page, task, skuMappings, hooks, options);
+  if (transport !== "api") throw error(`不支持的国补传输模式: ${transport}`, "subsidy_transport_invalid");
+  return executeTmallSubsidyApi(page, task, skuMappings, hooks, options);
 }

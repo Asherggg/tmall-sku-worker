@@ -2,6 +2,15 @@
 
 本文件记录 Tmall SKU Worker 的版本更新。详细发布验证见 [`docs/release/`](docs/release/)。
 
+## [0.1.21] - 2026-08-21
+
+### 国补纯接口
+
+- 默认复用已登录专属 Edge Profile 的 `BrowserContext.request`，通过动态 MTop 签名完成模板导出、OSS 上传配置、文件导入和商品列表回读。
+- `IMPORT` 保留外部写入门禁且不自动重试；响应未知或回读不一致进入人工复核。
+- 提交后严格比对新 SKU ID、69 码、国补品名和规格；页面驱动流程保留为 `TMALL_SUBSIDY_TRANSPORT=page` 显式 fallback。
+- 商品 `1061776009736` 已完成真实纯接口 `IMPORT`，提交只发送一次，服务端首次列表回读严格确认 9 个 SKU ID、69 码、国补品名和规格全部一致。
+
 ## [0.1.20] - 2026-08-20
 
 ### 国补流程

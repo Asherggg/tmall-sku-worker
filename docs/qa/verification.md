@@ -12,7 +12,9 @@
 - Both submit phases serialize and validate the intended form before direct HTTP submission.
 - Snapshot, preview, both submits, and readback use the authenticated API request context without page evaluation, events, reloads, or navigation.
 - Malformed bootstrap and canonical mapping failures fail closed without a page-operation fallback.
-- Automated suite: 56/56 passed for v0.1.20, including runtime config file loading for the remote inventory API, OMS response classification/readback, Doris material uniqueness and barcode enrichment, subsidy XLSX column filling, inventory-only drift acceptance, `newColorSelect` POST validation, alternate preview-key formats, SKU-detail parameter synchronization, 109-second convergence within the 150-second deadline, the deadline-point final GET, three-page login verification, and guarded Cartesian-placeholder filtering.
+- Automated suite: v0.1.21 开发基线新增国补纯接口模拟测试，覆盖 MTop 签名请求、`IMPORT` 不重试、OSS 域名白名单、dry-run 不跨写入边界，以及 SKU/69 码/品名/规格严格回读；完整测试结果以本次发布记录为准。
+- Subsidy API dry-run for `1061776009736`: reused the logged-in dedicated Edge profile, exported and downloaded a fresh 9-row template, filled all rows, and uploaded the XLSX to temporary OSS storage with HTTP 200. `writeStarted=false`; no `IMPORT` request was sent. Evidence is stored under `.runtime/subsidy-api-dry-run-1061776009736-1787282125325/`.
+- Subsidy API live import for `1061776009736`: after explicit user confirmation, the v0.1.21 adapter exported, filled, uploaded, and sent `IMPORT` once; all MTop/OSS operations returned HTTP 200 / `SUCCESS`. The first bounded server readback strictly verified all 9 SKU IDs, barcodes, subsidy product names, and specifications. Redacted evidence is stored under `.runtime/subsidy-api-live-0.1.21-1061776009736-1787287483490/`.
 
 ## Build
 
@@ -20,9 +22,10 @@
 - Rust `cargo check` passes.
 - Tauri release executable builds at `src-tauri/target/release/tmall-sku-worker.exe`.
 - The v0.1.20 NSIS installer builds at `src-tauri/target/release/bundle/nsis/Tmall SKU Worker_0.1.20_x64-setup.exe`; size `30,814,661` bytes; SHA-256 is `1C1E4248391BB0CC775AEC124063AA2852330AC5A14C839D872FC87D77C30D3C`.
-- Installation to `D:\Tmall SKU Worker` completed successfully. Installed Worker/config modules match the repository by SHA-256; installed `/health` returned `workerVersion=0.1.20`, `inventory.configured=true`, `subsidy.configured=true`, and `contract=configured`. The installed `/inventory/lookup` successfully read the configured remote API.
+- Installation to `D:\Tmall SKU Worker` remains on v0.1.20 during this development verification so the active logged-in session was not interrupted. The v0.1.21 bundled Worker was instead started from `src-tauri/target/release` on isolated port `19921`; `/health` returned `workerVersion=0.1.21`, `mode=demo`, and `contract=demo`, then the temporary process was stopped.
 - Real subsidy submission test for `1061776009736` completed successfully: 9 template rows matched, upload completed, the page showed a success result, and list readback verified all 9 new SKU/69-code pairs.
-- MSI packaging remains unverified because the external WiX toolchain download timed out; the verified release artifact is NSIS.
+- NSIS installer builds at `src-tauri/target/release/bundle/nsis/Tmall SKU Worker_0.1.21_x64-setup.exe`; size `30,817,510` bytes; SHA-256 is `FBFFE5B82A56D900144B852D33C733D5DECC023104260E37ABD66BAA7FC15967`. The bundled release resources include `worker/subsidy-api-adapter.mjs`.
+- MSI packaging remains unverified because the external WiX toolchain download timed out; the verified v0.1.21 release artifact is NSIS.
 
 ## UI smoke
 

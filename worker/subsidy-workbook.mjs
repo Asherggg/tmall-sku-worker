@@ -39,8 +39,10 @@ export function normalizeSkuMappings(mappings) {
     if (!oldSkuId || !newSkuId) throw Object.assign(new Error(`第 ${index + 1} 条 SKU 映射 ID 无效`), { code: "subsidy_mapping_invalid", index });
     const subMaterialName = text(mapping?.subMaterialName);
     const specification = text(mapping?.specification);
+    const barcode = text(mapping?.barcode);
     if (!subMaterialName || !specification) throw Object.assign(new Error(`SKU ${oldSkuId} 缺少国补品名或规格`), { code: "subsidy_mapping_metadata_missing", oldSkuId });
-    return { oldSkuId, newSkuId, materialNo: text(mapping?.materialNo), subMaterialName, specification };
+    if (barcode && !/^\d{8,20}$/.test(barcode)) throw Object.assign(new Error(`SKU ${oldSkuId} 的 69 码格式无效`), { code: "subsidy_mapping_barcode_invalid", oldSkuId });
+    return { oldSkuId, newSkuId, materialNo: text(mapping?.materialNo), barcode, subMaterialName, specification };
   });
   const keys = new Set(normalized.map(mappingKey));
   if (keys.size !== normalized.length) throw Object.assign(new Error("国补 SKU 映射存在重复项"), { code: "subsidy_mapping_duplicate" });
@@ -78,6 +80,14 @@ function findRowMapping(row, byId) {
 }
 
 function applyMapping(row, mapping) {
+  const templateBarcode = cellText(row.getCell("E"));
+  if (mapping.barcode && templateBarcode !== mapping.barcode) {
+    throw Object.assign(new Error(`国补模板第 ${row.number} 行的 69 码与 SKU ${mapping.newSkuId} 不一致`), {
+      code: "subsidy_template_barcode_mismatch",
+      row: row.number,
+      skuId: mapping.newSkuId,
+    });
+  }
   row.getCell("H").value = mapping.subMaterialName;
   row.getCell("I").value = mapping.specification;
   row.getCell("O").value = FIXED_VALUES.O;

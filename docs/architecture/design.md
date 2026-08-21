@@ -23,7 +23,7 @@ Tauri 2
 
 ### Worker
 
-- 源码直接启动默认 `demo`；v0.1.20 Windows 安装版由 Tauri host 显式启用 `tmall-publish-v2`，并要求 OMS、Doris 和国补契约同时配置。桌面 UI 只提供线上模式，批次预览列表在固定高度区域内滚动。适配器按服务端表单能力识别标准 SKU、SKU 明细和自定义销售属性异步校验，不按商品 ID 硬编码；最终回读使用 150 秒截止时间覆盖平台数据收敛，并只忽略可证明为空的笛卡尔积预检占位行。工作流配置从应用数据目录的 `runtime-config.json` 读取，避免依赖 Explorer 启动时继承的旧环境块。
+- 源码直接启动默认 `demo`；v0.1.21 Windows 安装版由 Tauri host 显式启用 `tmall-publish-v2`，并要求 OMS、Doris 和国补契约同时配置。桌面 UI 只提供线上模式，批次预览列表在固定高度区域内滚动。适配器按服务端表单能力识别标准 SKU、SKU 明细和自定义销售属性异步校验，不按商品 ID 硬编码；最终回读使用 150 秒截止时间覆盖平台数据收敛，并只忽略可证明为空的笛卡尔积预检占位行。工作流配置从应用数据目录的 `runtime-config.json` 读取，避免依赖 Explorer 启动时继承的旧环境块。国补默认复用该 Profile 的 MTop/OSS HTTP 接口，页面流程仅作显式 fallback。
 - SKU 最终一致性校验覆盖规格、价格、商家编码、条码和其他业务字段，但不比较 `skuStock`；库存由天猫库存系统实时维护，重建期间的库存变化不再阻断任务成功。
 - `live` 必须同时满足环境开关、批次确认词和任务快照校验。
 - 一个 Profile 只有一个 Worker；同一账号同一时间只写一个 `itemId`。OMS、淘宝卖家中心和国补页面可在同一 Profile 的不同标签页中使用，但 Cookie 仍按域隔离，首次认证必须人工完成。
@@ -93,7 +93,9 @@ OMS 适配器只允许访问 `https://gateway.shuixing.com/oms-system/base/platf
 
 Doris 适配器只允许固定数据库/表和固定字段查询。每个料号必须得到唯一一致的记录；`barcode`、`sub_material_name`、`specification` 任一关键字段缺失都不能继续。Doris 凭据只从运行时环境读取，不写入状态、审计或模板。
 
-国补适配器兼容当前“手动输入商品 ID -> 下载模板 -> 上传 XLSX -> 提交”流程和旧版替换 SKU 流程；使用 Playwright 文件下载和上传 API。不猜测未知提交接口。模板中旧/新 SKU ID 无法匹配、H/I/O/P/Q 填充不完整、上传未完成或提交没有明确成功提示时停止。
+国补适配器默认使用已登录 Edge Profile 的 `BrowserContext.request` 走纯 HTTP 链路：动态读取 `_m_h5_tk` 前缀计算当次 MTop 签名，调用已捕获验证的模板 `EXPORT`/`QUERY_PROGRESS`、OSS 上传配置、文件 `IMPORT` 和商品列表回读接口。签名、Cookie、OSS Policy、临时 URL、上传 key 和完整请求体只存在于内存，不写入任务或审计。`IMPORT` 前必须先持久化外部写入状态；该请求不因 token、超时或未知响应自动重试。提交后按商品 ID 回读，并逐项确认新 SKU ID、69 码、国补品名和规格，全部一致才报告成功。
+
+页面驱动的“手动输入商品 ID -> 下载模板 -> 上传 XLSX -> 提交”流程保留为显式 fallback，可通过 `TMALL_SUBSIDY_TRANSPORT=page` 启用；默认值为 `api`。纯接口流程一旦开始，不因接口失败自动切换页面提交，避免重复写入。模板中旧/新 SKU ID 无法匹配、模板 69 码与映射不一致、H/I/O/P/Q 填充不完整、OSS 上传失败、提交响应未知或列表回读不一致时停止并进入人工复核。
 
 ## 6. 失败与恢复
 

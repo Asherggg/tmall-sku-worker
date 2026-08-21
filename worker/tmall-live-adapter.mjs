@@ -457,7 +457,7 @@ export function summarizeForm(formValues) {
 function inventoryMappingFromRow(row, resolved) {
   return {
     materialNo: String(resolved?.materialNo ?? row?.skuOuterId ?? "").trim(),
-    barcode: String(resolved?.barcode ?? "").trim(),
+    barcode: String(resolved?.barcode ?? "").trim() || String(row?.skuBarcode ?? "").trim(),
     subMaterialName: String(resolved?.subMaterialName ?? "").trim(),
     specification: String(resolved?.specification ?? "").trim(),
   };

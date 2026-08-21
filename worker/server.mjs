@@ -18,7 +18,7 @@ const DATA_DIR = process.env.TMALL_DATA_DIR || path.join(__dirname, "..", ".runt
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const CONFIRMATION = "确认线上重建";
 const MANUAL_REVIEW_CONFIRMATION = "确认已人工核对";
-const VERSION = "0.1.20";
+const VERSION = "0.1.21";
 const DEFAULT_LOGIN_URL = "https://myseller.taobao.com/home.htm/QnworkbenchHome/";
 const OMS_LOGIN_URL = OMS_PAGE_URL;
 const SUBSIDY_LOGIN_URL = SUBSIDY_URL;
@@ -106,6 +106,8 @@ function addAudit(task, phase, details = {}) {
     path: details.path || "worker://local",
     status: details.status,
     ...(Number.isFinite(Number(details.durationMs)) ? { durationMs: Number(details.durationMs) } : {}),
+    ...(Number.isFinite(Number(details.attempts)) ? { attempts: Number(details.attempts) } : {}),
+    ...(Number.isFinite(Number(details.recordCount)) ? { recordCount: Number(details.recordCount) } : {}),
     ...(details.strategy ? { strategy: details.strategy } : {}),
     ...(details.fastReadbackError ? { fastReadbackError: details.fastReadbackError } : {}),
     businessCode: details.businessCode,
@@ -696,9 +698,22 @@ async function runLiveTask(task) {
         task.writePhase = entry.phase;
         saveState();
       },
+      onNetwork(entry) {
+        addAudit(task, entry.phase, { method: entry.method, path: entry.path, status: entry.status, businessCode: entry.businessCode });
+        saveState();
+      },
+      onReadback(entry) {
+        addAudit(task, entry.phase, { method: entry.method, path: entry.path, status: entry.status, attempts: entry.attempts, recordCount: entry.rowCount, businessCode: "SUCCESS" });
+        saveState();
+      },
     }, { dataDir: DATA_DIR });
     state.browser.subsidyLoggedIn = true;
-    task.subsidy = { matchedRows: subsidy.matchedRows, workbookSha256: subsidy.workbookSha256 };
+    task.subsidy = {
+      transport: subsidy.transport || "page",
+      matchedRows: subsidy.matchedRows,
+      workbookSha256: subsidy.workbookSha256,
+      readback: subsidy.readback,
+    };
     task.status = "succeeded";
     task.progress = 100;
     task.errorCode = undefined;
