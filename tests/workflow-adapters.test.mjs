@@ -63,7 +63,7 @@ test("Doris lookup SQL uses a fixed table and escaped material values", () => {
   assert.throws(() => buildInventoryLookupSql({ materialNos: [] }), (error) => error.code === "inventory_materials_empty");
 });
 
-test("runtime config file supplies remote inventory API settings", async () => {
+test("runtime config file supplies the token for the fixed inventory API", async () => {
   const previous = Object.fromEntries([
     "TMALL_RUNTIME_CONFIG",
     "INVENTORY_API_BASE_URL",
@@ -74,22 +74,23 @@ test("runtime config file supplies remote inventory API settings", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tmall-runtime-config-"));
   const configPath = path.join(dir, "runtime-config.json");
   fs.writeFileSync(configPath, `${JSON.stringify({
-    INVENTORY_API_BASE_URL: "http://inventory.example.test:9031",
-    INVENTORY_API_PATH: "/v1/materials/lookup",
+    INVENTORY_API_BASE_URL: "https://ignored.example.test",
+    INVENTORY_API_PATH: "/ignored",
     INVENTORY_API_TOKEN: "test-token",
-    INVENTORY_API_ALLOW_INSECURE_HTTP: "true",
+    INVENTORY_API_ALLOW_INSECURE_HTTP: "false",
   })}\n`, "utf8");
   for (const name of Object.keys(previous)) delete process.env[name];
   process.env.TMALL_RUNTIME_CONFIG = configPath;
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
-    assert.equal(url, "http://inventory.example.test:9031/v1/materials/lookup");
+    assert.equal(url, "http://10.21.16.213:9031/v1/materials/lookup");
     assert.equal(init.headers.Authorization, "Bearer test-token");
     return new Response(JSON.stringify({ materialNo: "100047", barcode: "6944007300463", subMaterialName: "测试品", specification: "48cm×74cm" }), { status: 200 });
   };
   try {
     const repository = createInventoryRepository();
     assert.equal(inventoryHealth().mode, "remote_api");
+    assert.equal(inventoryHealth().apiUrl, "http://10.21.16.213:9031/v1/materials/lookup");
     assert.deepEqual(await repository.lookup(["100047"]), [{
       total_material_no: "100047",
       barcode: "6944007300463",

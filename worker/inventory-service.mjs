@@ -7,6 +7,7 @@ const BARCODE = /^\d{8,20}$/;
 
 export const DEFAULT_INVENTORY_DATABASE = "guanyuan_back";
 export const DEFAULT_INVENTORY_TABLE = "ecommerce_sales_inventory_daily_report";
+export const FIXED_INVENTORY_API_BASE_URL = "http://10.21.16.213:9031";
 export const DEFAULT_INVENTORY_API_PATH = "/v1/materials/lookup";
 export const INVENTORY_FIELDS = ["total_material_no", "barcode", "sub_material_name", "specification", "updated_at"];
 
@@ -104,8 +105,9 @@ function requestConfig(config = {}) {
   const value = (name) => runtimeValue(name);
   const database = safeIdentifier(config.database || value("DORIS_DATABASE"), DEFAULT_INVENTORY_DATABASE);
   const table = safeIdentifier(config.table || value("DORIS_TABLE"), DEFAULT_INVENTORY_TABLE);
-  const apiBaseUrl = text(config.apiBaseUrl || value("INVENTORY_API_BASE_URL"));
-  const apiPath = text(config.apiPath || value("INVENTORY_API_PATH") || DEFAULT_INVENTORY_API_PATH);
+  const usesFixedApi = config.apiBaseUrl === undefined;
+  const apiBaseUrl = text(usesFixedApi ? FIXED_INVENTORY_API_BASE_URL : config.apiBaseUrl);
+  const apiPath = text(config.apiPath || DEFAULT_INVENTORY_API_PATH);
   const apiToken = text(config.apiToken || value("INVENTORY_API_TOKEN"));
   const apiAuthHeader = text(config.apiAuthHeader || value("INVENTORY_API_AUTH_HEADER") || "Authorization");
   const apiAuthScheme = text(config.apiAuthScheme || value("INVENTORY_API_AUTH_SCHEME") || "Bearer");
@@ -121,7 +123,7 @@ function requestConfig(config = {}) {
       throw Object.assign(new Error("INVENTORY_API_BASE_URL 不是有效 URL"), { code: "inventory_config_invalid", cause });
     }
     const local = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
-    const allowInsecureHttp = String(config.allowInsecureHttp ?? value("INVENTORY_API_ALLOW_INSECURE_HTTP") ?? "false").toLowerCase() === "true";
+    const allowInsecureHttp = usesFixedApi || String(config.allowInsecureHttp ?? "false").toLowerCase() === "true";
     if (parsed.protocol !== "https:" && !(local && parsed.protocol === "http:") && !(allowInsecureHttp && parsed.protocol === "http:")) {
       throw Object.assign(new Error("INVENTORY_API_BASE_URL 必须使用 HTTPS；内网 HTTP 仅可通过 INVENTORY_API_ALLOW_INSECURE_HTTP=true 显式开启"), { code: "inventory_config_invalid" });
     }
@@ -168,7 +170,12 @@ export function inventoryHealth(config = {}) {
       apiUrl: resolved.mode === "remote_api" ? `${resolved.apiBaseUrl}${resolved.apiPath}` : undefined,
     };
   } catch (error) {
-    return { configured: false, mode: "invalid", message: error.message };
+    return {
+      configured: false,
+      mode: error.code === "inventory_config_missing" ? "missing" : "invalid",
+      apiUrl: `${FIXED_INVENTORY_API_BASE_URL}${DEFAULT_INVENTORY_API_PATH}`,
+      message: error.message,
+    };
   }
 }
 

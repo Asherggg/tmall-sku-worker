@@ -101,6 +101,12 @@ export interface SkuMapping extends InventoryMapping {
   newSkuId: string;
 }
 
+export interface WorkflowHealth {
+  configured: boolean;
+  missing: Array<"sku_rebuild" | "inventory" | "subsidy">;
+  configPath?: string | null;
+}
+
 export interface WorkerHealth {
   ready: boolean;
   mode: "demo" | "live";
@@ -112,6 +118,7 @@ export interface WorkerHealth {
   subsidyLoggedIn?: boolean;
   inventory?: InventoryHealth;
   subsidy?: { configured: boolean; enabled: boolean };
+  workflow?: WorkflowHealth;
   riskRequired?: boolean;
   contract: "demo" | "configured" | "missing";
   message?: string;

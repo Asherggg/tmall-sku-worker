@@ -23,7 +23,7 @@ Tauri 2
 
 ### Worker
 
-- 源码直接启动默认 `demo`；v0.1.21 Windows 安装版由 Tauri host 显式启用 `tmall-publish-v2`，并要求 OMS、Doris 和国补契约同时配置。桌面 UI 只提供线上模式，批次预览列表在固定高度区域内滚动。适配器按服务端表单能力识别标准 SKU、SKU 明细和自定义销售属性异步校验，不按商品 ID 硬编码；最终回读使用 150 秒截止时间覆盖平台数据收敛，并只忽略可证明为空的笛卡尔积预检占位行。工作流配置从应用数据目录的 `runtime-config.json` 读取，避免依赖 Explorer 启动时继承的旧环境块。国补默认复用该 Profile 的 MTop/OSS HTTP 接口，页面流程仅作显式 fallback。
+- 源码直接启动默认 `demo`；v0.1.23 Windows 安装版由 Tauri host 显式启用 `tmall-publish-v2`。桌面 UI 只提供线上模式，批次预览列表在固定高度区域内滚动。适配器按服务端表单能力识别标准 SKU、SKU 明细和自定义销售属性异步校验，不按商品 ID 硬编码；最终回读使用 150 秒截止时间覆盖平台数据收敛，并只忽略可证明为空的笛卡尔积预检占位行。商品资料接口固定为 `http://10.21.16.213:9031/v1/materials/lookup`，国补流程固定开启；构建阶段从受控发布配置生成忽略提交的凭据资源，Tauri host 启动 Worker 时以环境变量注入。用户无需填写流程配置，发布凭据不进入 Git 源码、UI、任务状态或审计导出。国补默认复用该 Profile 的 MTop/OSS HTTP 接口，页面流程仅作显式 fallback。
 - SKU 最终一致性校验覆盖规格、价格、商家编码、条码和其他业务字段，但不比较 `skuStock`；库存由天猫库存系统实时维护，重建期间的库存变化不再阻断任务成功。
 - `live` 必须同时满足环境开关、批次确认词和任务快照校验。
 - 一个 Profile 只有一个 Worker；同一账号同一时间只写一个 `itemId`。OMS、淘宝卖家中心和国补页面可在同一 Profile 的不同标签页中使用，但 Cookie 仍按域隔离，首次认证必须人工完成。
@@ -79,7 +79,8 @@ interface ItemTaskInput {
 - Edge 只提供人工登录后的认证上下文；任务执行使用 Playwright `BrowserContext.request` 共享该上下文的 Cookie，认证字段只存在于内存，不写入任务或审计。
 - 写入流程是：完整表单快照 -> 临时唯一规格提交 -> 回读新 SKU -> 恢复原字段提交 -> 详情回读。
 - 商品快照、销售属性元数据和动态提交字段直接从 `GET /tmall/publish.htm?id=<itemId>` 的服务端 bootstrap 解析；不读取或修改 `GlobalStore`。
-- 运行时配置文件只存放在应用数据目录，不进入仓库、任务状态或审计导出；远程资料服务使用 `INVENTORY_API_BASE_URL`、`INVENTORY_API_PATH`、`INVENTORY_API_TOKEN` 和显式的 `INVENTORY_API_ALLOW_INSECURE_HTTP` 配置。
+- 商品资料服务固定使用 `http://10.21.16.213:9031/v1/materials/lookup`；发布构建必须提供 `INVENTORY_API_TOKEN`，并生成不进入 Git 的安装资源。Tauri 只把该值注入 Worker 环境，不写入任务状态或审计导出，运行时配置不能覆盖固定接口。
+
 - 规格预检直接调用 `POST /tmall/asyncOpt.htm?optType=salePropValueChangeAsync`；`newColorSelect` 自定义值校验同样使用页面协议的 `POST /tmall/asyncOpt.htm`，请求体携带 `jsonBody:{text}` 与当次 `globalExtendInfo`，不能回退旧版 `GET + keyword`。预检组合键同时兼容平台返回的 `pid-value` 与 `pid--value`，规范化后仍须逐项校验属性 ID、值 ID 和组合唯一性。两次写入直接调用 `POST /tmall/submit.htm`，使用当次 bootstrap 的完整 `formValues`、`globalExtendInfo` 和渲染跟踪字段。
 - SKU 明细页修改销售属性时，若同名 `skuParam_p-*` 原本镜像该属性，临时值必须同步更新；用于区分同一销售属性组合的独立 SKU 参数必须保留。
 - 每次提交后只通过 HTTP GET 轮询服务端 bootstrap，并按临时商家编码或销售属性组合进行一一映射。解析、映射或身份校验失败时直接进入人工复核，不回退页面导航。

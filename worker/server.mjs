@@ -9,7 +9,7 @@ import { createInventoryRepository, inventoryHealth, lookupDigest, resolveSkuInv
 import { executeOmsDisable, OMS_PAGE_URL } from "./oms-platform-adapter.mjs";
 import { executeTmallRebuild } from "./tmall-live-adapter.mjs";
 import { executeTmallSubsidy, SUBSIDY_URL } from "./tmall-subsidy-adapter.mjs";
-import { runtimeValue } from "./runtime-config.mjs";
+import { runtimeConfigPath } from "./runtime-config.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.TMALL_WORKER_PORT || 19828);
@@ -18,11 +18,11 @@ const DATA_DIR = process.env.TMALL_DATA_DIR || path.join(__dirname, "..", ".runt
 const STATE_FILE = path.join(DATA_DIR, "state.json");
 const CONFIRMATION = "确认线上重建";
 const MANUAL_REVIEW_CONFIRMATION = "确认已人工核对";
-const VERSION = "0.1.21";
+const VERSION = "0.1.23";
 const DEFAULT_LOGIN_URL = "https://myseller.taobao.com/home.htm/QnworkbenchHome/";
 const OMS_LOGIN_URL = OMS_PAGE_URL;
 const SUBSIDY_LOGIN_URL = SUBSIDY_URL;
-const SUBSIDY_ENABLED = String(runtimeValue("TMALL_SUBSIDY_ENABLED") ?? "false").toLowerCase() === "true";
+const SUBSIDY_ENABLED = true;
 const BROWSER_CDP_PORT = Number(process.env.TMALL_BROWSER_CDP_PORT || PORT + 1);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -206,7 +206,18 @@ function health() {
   const contractConfigured = process.env.TMALL_LIVE_CONTRACT === "tmall-publish-v2";
   const inventory = inventoryHealth();
   const subsidyConfigured = !liveEnabled || SUBSIDY_ENABLED;
-  const workflowConfigured = !liveEnabled || (contractConfigured && inventory.configured && subsidyConfigured);
+  const missing = [];
+  if (liveEnabled && !contractConfigured) missing.push("sku_rebuild");
+  if (liveEnabled && !inventory.configured) missing.push("inventory");
+  if (liveEnabled && !subsidyConfigured) missing.push("subsidy");
+  const workflowConfigured = !liveEnabled || missing.length === 0;
+  const missingLabels = {
+    sku_rebuild: "SKU 重建契约",
+    inventory: inventory.mode === "missing"
+      ? "Doris 商品资料访问令牌"
+      : `Doris 商品资料配置${inventory.message ? `（${inventory.message}）` : ""}`,
+    subsidy: "国补流程开关",
+  };
   return {
     ready: true,
     mode: liveEnabled ? "live" : "demo",
@@ -220,9 +231,12 @@ function health() {
     webdriver: state.browser.webdriver,
     inventory,
     subsidy: { configured: subsidyConfigured, enabled: SUBSIDY_ENABLED },
+    workflow: { configured: workflowConfigured, missing, configPath: runtimeConfigPath() },
     contract: liveEnabled ? (workflowConfigured ? "configured" : "missing") : "demo",
     unresolvedLiveWrites: state.tasks.filter((task) => externalWriteStarted(task) && task.status !== "succeeded").length,
-    message: liveEnabled && !workflowConfigured ? "OMS、Doris 或国补流程尚未完成配置；未发出线上写请求" : liveEnabled ? "OMS、Doris、SKU 重建和国补流程已配置" : undefined,
+    message: liveEnabled && !workflowConfigured
+      ? `${missing.map((name) => missingLabels[name]).join("、")}未配置；未发出线上写请求`
+      : liveEnabled ? "OMS、Doris、SKU 重建和国补流程已配置" : undefined,
   };
 }
 

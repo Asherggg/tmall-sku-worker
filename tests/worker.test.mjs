@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import net from "node:net";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,12 +9,21 @@ import { fileURLToPath } from "node:url";
 import { isLoggedInUrl, isOmsSessionReady, isSubsidySessionReady } from "../worker/browser-url.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const port = 19980 + Math.floor(Math.random() * 100);
+
+async function availablePort() {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => server.once("error", reject).listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  await new Promise((resolve) => server.close(resolve));
+  return address.port;
+}
+
+const port = await availablePort();
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmall-worker-test-"));
 let child;
 
 async function waitForWorker() {
-  const deadline = Date.now() + 5000;
+  const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/health`);
@@ -21,11 +31,11 @@ async function waitForWorker() {
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error("worker did not start");
+  throw new Error(`worker on ${port} did not start (exit=${child?.exitCode}, stderr=${child?.__stderr || "none"})`);
 }
 
 async function waitForWorkerAt(workerPort) {
-  const deadline = Date.now() + 5000;
+  const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     try {
       const response = await fetch(`http://127.0.0.1:${workerPort}/health`);
@@ -37,20 +47,39 @@ async function waitForWorkerAt(workerPort) {
 }
 
 function spawnWorker(workerPort, workerDataDir, extraEnv = {}) {
-  return spawn(process.execPath, [path.join(root, "worker", "server.mjs")], {
+  const processHandle = spawn(process.execPath, [path.join(root, "worker", "server.mjs")], {
     cwd: root,
     env: { ...process.env, TMALL_WORKER_PORT: String(workerPort), TMALL_DATA_DIR: workerDataDir, ...extraEnv },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  processHandle.__stderr = "";
+  processHandle.stderr.on("data", (chunk) => { processHandle.__stderr += chunk.toString(); });
+  return processHandle;
+}
+
+async function waitForExit(processHandle, timeoutMs) {
+  if (processHandle.exitCode != null) return true;
+  return new Promise((resolve) => {
+    const onExit = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      processHandle.off("exit", onExit);
+      resolve(processHandle.exitCode != null);
+    }, timeoutMs);
+    processHandle.once("exit", onExit);
   });
 }
 
 async function stopWorker(processHandle) {
   if (!processHandle || processHandle.exitCode != null) return;
-  await new Promise((resolve) => {
-    processHandle.once("exit", resolve);
-    processHandle.kill();
-    setTimeout(resolve, 1500).unref();
-  });
+  const gracefulExit = waitForExit(processHandle, 5000);
+  processHandle.kill();
+  if (await gracefulExit || processHandle.exitCode != null) return;
+  const forcedExit = waitForExit(processHandle, 5000);
+  processHandle.kill("SIGKILL");
+  await forcedExit;
 }
 
 async function waitForTask(taskId, predicate, workerPort = port) {
@@ -65,11 +94,7 @@ async function waitForTask(taskId, predicate, workerPort = port) {
 }
 
 test.before(async () => {
-  child = spawn(process.execPath, [path.join(root, "worker", "server.mjs")], {
-    cwd: root,
-    env: { ...process.env, TMALL_WORKER_PORT: String(port), TMALL_DATA_DIR: dataDir, TMALL_LIVE_ENABLED: "false" },
-    stdio: "ignore",
-  });
+  child = spawnWorker(port, dataDir, { TMALL_LIVE_ENABLED: "false" });
   await waitForWorker();
 });
 
@@ -84,6 +109,46 @@ test("health starts in safe demo mode", async () => {
   assert.equal(path.basename(health.profile), "edge-profile-v2");
   assert.equal(health.riskRequired, false);
   assert.equal(health.webdriver, null);
+});
+
+test("live health reports exact missing workflow configuration", async () => {
+  const isolatedPort = await availablePort();
+  const isolatedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmall-worker-config-test-"));
+  let isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, {
+    TMALL_LIVE_ENABLED: "true",
+    TMALL_LIVE_CONTRACT: "tmall-publish-v2",
+    TMALL_RUNTIME_CONFIG: path.join(isolatedDataDir, "runtime-config.json"),
+  });
+  try {
+    await waitForWorkerAt(isolatedPort);
+    const missing = await (await fetch(`http://127.0.0.1:${isolatedPort}/health`)).json();
+    assert.equal(missing.workerVersion, "0.1.23");
+    assert.equal(missing.contract, "missing");
+    assert.deepEqual(missing.workflow.missing, ["inventory"]);
+    assert.match(missing.message, /Doris 商品资料访问令牌/);
+    assert.doesNotMatch(missing.message, /国补流程开关|OMS/);
+    assert.equal(missing.inventory.apiUrl, "http://10.21.16.213:9031/v1/materials/lookup");
+    assert.equal(missing.subsidy.configured, true);
+    assert.equal(missing.workflow.configPath, path.join(isolatedDataDir, "runtime-config.json"));
+
+    await stopWorker(isolatedChild);
+    isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, {
+      TMALL_LIVE_ENABLED: "true",
+      TMALL_LIVE_CONTRACT: "tmall-publish-v2",
+      TMALL_RUNTIME_CONFIG: path.join(isolatedDataDir, "runtime-config.json"),
+      INVENTORY_API_TOKEN: "test-token",
+    });
+    await waitForWorkerAt(isolatedPort);
+    const configured = await (await fetch(`http://127.0.0.1:${isolatedPort}/health`)).json();
+    assert.equal(configured.contract, "configured");
+    assert.equal(configured.inventory.configured, true);
+    assert.equal(configured.inventory.apiUrl, "http://10.21.16.213:9031/v1/materials/lookup");
+    assert.equal(configured.subsidy.configured, true);
+    assert.deepEqual(configured.workflow.missing, []);
+  } finally {
+    await stopWorker(isolatedChild);
+    fs.rmSync(isolatedDataDir, { recursive: true, force: true });
+  }
 });
 
 test("seller, OMS, and subsidy login signals are classified without business writes", () => {
@@ -118,11 +183,8 @@ test("demo batch runs item tasks and creates synthetic readback IDs", async () =
     body: JSON.stringify({ mode: "demo", items: [{ itemId: "10001", skuIds: ["20001", "20002"], expectedSkuCount: 2 }] }),
   });
   assert.equal(create.status, 201);
-  const { batchId } = await create.json();
-  await new Promise((resolve) => setTimeout(resolve, 1400));
-  const tasksResponse = await fetch(`http://127.0.0.1:${port}/tasks`);
-  const { tasks } = await tasksResponse.json();
-  const task = tasks.find((entry) => entry.batchId === batchId);
+  const { tasks: createdTasks } = await create.json();
+  const task = await waitForTask(createdTasks[0].id, (entry) => entry.status === "succeeded");
   assert.equal(task.status, "succeeded");
   assert.equal(task.newSkuIds.length, 2);
   assert.equal(task.progress, 100);
@@ -215,12 +277,10 @@ test("item-only batches are accepted without pretending SKU readback succeeded",
     body: JSON.stringify({ mode: "demo", items: [{ itemId: "828872681901", skuIds: [] }] }),
   });
   assert.equal(response.status, 201);
-  const { batchId, tasks: createdTasks } = await response.json();
+  const { tasks: createdTasks } = await response.json();
   assert.deepEqual(createdTasks[0].skuIds, []);
 
-  await new Promise((resolve) => setTimeout(resolve, 1400));
-  const { tasks } = await (await fetch(`http://127.0.0.1:${port}/tasks`)).json();
-  const task = tasks.find((entry) => entry.batchId === batchId);
+  const task = await waitForTask(createdTasks[0].id, (entry) => entry.status === "succeeded");
   assert.equal(task.status, "succeeded");
   assert.deepEqual(task.newSkuIds, []);
   const messages = task.timeline.map((entry) => entry.message).join("\n");
@@ -299,7 +359,7 @@ test("retry runs only the queued task and does not replay sibling manual-review 
 });
 
 test("an unresolved live write survives restart and locks the item", async () => {
-  const isolatedPort = port + 200;
+  const isolatedPort = await availablePort();
   const isolatedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmall-worker-lock-test-"));
   const createdAt = new Date().toISOString();
   fs.writeFileSync(path.join(isolatedDataDir, "state.json"), `${JSON.stringify({

@@ -2,6 +2,31 @@
 
 本文件记录 Tmall SKU Worker 的版本更新。详细发布验证见 [`docs/release/`](docs/release/)。
 
+## [0.1.23] - 2026-08-21
+
+### 固定工作流
+
+- 商品资料服务固定为 `http://10.21.16.213:9031/v1/materials/lookup`，运行时配置不能覆盖。
+- 国补流程固定开启，桌面 UI 不再显示流程配置入口。
+- 访问凭据由发布构建生成到忽略提交的安装资源，Tauri 启动 Worker 时直接注入；用户只需完成三个站点登录。
+- 发布构建缺少固定凭据时直接失败，避免生成无法执行线上批次的安装包。
+
+## [0.1.22] - 2026-08-21
+
+### 流程配置
+
+- 新增应用内“流程配置”页，可填写 Doris 商品资料服务地址、查询路径和访问令牌，并启用国补流程。
+- Token 只写入用户应用数据目录；保存后前端只能看到“已配置”状态，不会回显 Token。
+- Tauri host 在首次启动时迁移显式旧配置路径、旧一级目录配置或受支持的旧环境变量，覆盖升级保留现有配置。
+- Worker `/health` 返回精确缺失项，不再把三站登录成功误写成 OMS、Doris、SKU 重建和国补均未配置。
+
+### 验证
+
+- `npm test`: 63/63 passed。
+- `npm run build`: passed。
+- `cargo test --manifest-path src-tauri/Cargo.toml`: 2/2 passed。
+- `cargo check --manifest-path src-tauri/Cargo.toml`: passed。
+
 ## [0.1.21] - 2026-08-21
 
 ### 国补纯接口

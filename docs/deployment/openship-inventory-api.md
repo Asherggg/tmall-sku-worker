@@ -218,7 +218,7 @@ CMD ["node", "dist/server.js"]
 
 OpenShip 支持把 `{ "value": "...", "secret": true }` 作为加密 Secret 保存。即使如此，建议首次部署后再在 OpenShip 控制台替换占位值，并检查日志中没有打印环境变量。
 
-如果暂时没有企业 OIDC，可以先使用每台设备独立的短期 API Key；不要让所有安装包共享一个永久 Token。正式版本应切换到用户登录或设备注册后的短期令牌。
+v0.1.23 使用统一发布凭据：构建时从受控发布配置生成 Git 忽略的安装资源，安装版不要求用户录入 Token。凭据轮换时必须重新构建和分发安装包，并使旧凭据按发布计划失效。
 
 ## 6. OpenShip 部署步骤
 
@@ -265,13 +265,15 @@ curl -fsS -X POST \
 
 ## 7. 桌面端接入改动
 
-正式接入时，Worker 使用：
+v0.1.23 Worker 固定使用：
 
 ```text
-INVENTORY_API_BASE_URL=https://inventory-api.example.com
+INVENTORY_API_BASE_URL=http://10.21.16.213:9031
 INVENTORY_API_PATH=/v1/materials/lookup
-INVENTORY_API_TOKEN=<short-lived-token>
+INVENTORY_API_TOKEN=<release-config-token>
 ```
+
+地址、路径和国补开关由代码固定；Token 由 Tauri 从安装资源注入 Worker 子进程，用户侧不提供流程配置入口。
 
 请求体只包含料号：
 
@@ -281,7 +283,7 @@ INVENTORY_API_TOKEN=<short-lived-token>
 
 服务可以返回单条资料对象，也可以返回 `{ records: [...] }`；Worker 会识别 `materialNo` 和 `barcode`，并将返回的 `barcode` 用于补全空的 69 码。
 
-并在请求中附加用户/设备短期令牌。桌面端不再使用以下生产配置：
+请求附加发布版本对应的统一令牌。桌面端不再使用以下生产配置：
 
 ```text
 DORIS_MYSQL_HOST
@@ -308,7 +310,7 @@ OMS 登录态、淘宝登录态和国补登录态仍只保留在用户本机的�
 - Doris 只读账号不能执行写操作。
 - Doris 端口不对公网开放。
 - 未认证调用无法查询。
-- 每个用户只能查询授权范围内的资料。
+- 发布令牌只能访问固定商品资料查询接口。
 - OpenShip Secret 不会出现在 Git、Docker 镜像层、构建日志和应用审计中。
 
 ### 可运维性
@@ -321,4 +323,4 @@ OMS 登录态、淘宝登录态和国补登录态仍只保留在用户本机的�
 
 ## 9. 凭据处理说明
 
-当前开发环境能够通过已配置的 Doris 连接执行查询，但 Doris 的 URL、账号和密码不写入本方案、源码、Dockerfile、`openship.json` 的提交版本或桌面安装包。部署时将实际值粘贴到 OpenShip 的 Secret 配置中，并在部署后轮换一次读取密码。
+当前开发环境能够通过已配置的 Doris 连接执行查询，但 Doris 的 URL、账号和密码不写入本方案、源码、Dockerfile 或 `openship.json` 的提交版本。v0.1.23 的商品资料 API Token 从发布机受控配置生成到 Git 忽略的 Tauri 安装资源；构建日志、桌面 UI、任务状态和审计导出不输出该值。部署时在凭据轮换后同步生成新安装包。
