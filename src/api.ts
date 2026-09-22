@@ -1,4 +1,4 @@
-import type { BatchRecord, ItemInput, TaskRecord, WorkerHealth } from "./types";
+import type { AddPatternItemInput, BatchRecord, ChannelOption, ItemInput, TaskOperation, TaskRecord, WorkerHealth } from "./types";
 import { parseImport } from "./import-parser";
 
 export { parseImport };
@@ -8,7 +8,7 @@ const BASE = import.meta.env.VITE_WORKER_URL || "http://127.0.0.1:19828";
 const demoHealth: WorkerHealth = {
   ready: false,
   mode: "demo",
-  workerVersion: "0.1.23",
+  workerVersion: "0.1.30",
   browser: "unavailable",
   profile: "应用专属 Profile",
   loggedIn: false,
@@ -36,18 +36,20 @@ export async function getHealth(): Promise<WorkerHealth> {
   }
 }
 
-export async function getTasks(): Promise<TaskRecord[]> {
+export async function getTasks(operation?: TaskOperation): Promise<TaskRecord[]> {
   try {
-    const payload = await request<{ tasks: TaskRecord[] }>("/tasks");
+    const query = operation ? `?operation=${encodeURIComponent(operation)}` : "";
+    const payload = await request<{ tasks: TaskRecord[] }>(`/tasks${query}`);
     return payload.tasks;
   } catch {
     return [];
   }
 }
 
-export async function getBatches(): Promise<BatchRecord[]> {
+export async function getBatches(operation?: TaskOperation): Promise<BatchRecord[]> {
   try {
-    const payload = await request<{ batches: BatchRecord[] }>("/batches");
+    const query = operation ? `?operation=${encodeURIComponent(operation)}` : "";
+    const payload = await request<{ batches: BatchRecord[] }>(`/batches${query}`);
     return payload.batches;
   } catch {
     return [];
@@ -59,7 +61,14 @@ export async function exportAudit() {
 }
 
 export async function createBatch(items: ItemInput[], mode: "demo" | "live", confirmation: string) {
-  return request<{ batchId: string; tasks: TaskRecord[] }>("/tasks", { method: "POST", body: JSON.stringify({ items, mode, confirmation }) });
+  return request<{ batchId: string; tasks: TaskRecord[] }>("/tasks", { method: "POST", body: JSON.stringify({ operation: "sku_rebuild", items, mode, confirmation }) });
+}
+
+export async function createAddPatternBatch(items: AddPatternItemInput[], mode: "demo" | "live", confirmation: string) {
+  return request<{ batchId: string; tasks: TaskRecord[] }>("/tasks", {
+    method: "POST",
+    body: JSON.stringify({ operation: "add_pattern", items, mode, confirmation }),
+  });
 }
 
 export async function startBatch(batchId: string, confirmation: string) {
@@ -70,8 +79,14 @@ export async function pauseTask(taskId: string) {
   return request<{ accepted: boolean }>(`/tasks/${encodeURIComponent(taskId)}/pause`, { method: "POST" });
 }
 
-export async function retryTask(taskId: string) {
-  return request<{ accepted: boolean }>(`/tasks/${encodeURIComponent(taskId)}/retry`, { method: "POST" });
+export async function retryTask(taskId: string, channelOption?: ChannelOption, confirmChannelMigration = false) {
+  return request<{ accepted: boolean; channelOption?: ChannelOption }>(`/tasks/${encodeURIComponent(taskId)}/retry`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...(channelOption ? { channelOption } : {}),
+      ...(confirmChannelMigration ? { confirmChannelMigration: true } : {}),
+    }),
+  });
 }
 
 export async function deleteTask(taskId: string, confirmation?: string) {
@@ -81,6 +96,6 @@ export async function deleteTask(taskId: string, confirmation?: string) {
   });
 }
 
-export async function browserAction(action: "login" | "hide" | "verify" | "oms" | "subsidy") {
+export async function browserAction(action: "login" | "hide" | "verify") {
   return request<WorkerHealth>(`/browser/${action}`, { method: "POST" });
 }

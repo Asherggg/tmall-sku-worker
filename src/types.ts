@@ -1,4 +1,11 @@
 export type Mode = "demo" | "live";
+export type TaskOperation = "sku_rebuild" | "add_pattern";
+export type ChannelOption = "1" | "2";
+
+export const CHANNEL_OPTION_LABELS: Record<ChannelOption, string> = {
+  "1": "纯电商",
+  "2": "商场同款",
+};
 
 export type TaskStatus =
   | "draft"
@@ -6,20 +13,14 @@ export type TaskStatus =
   | "planned"
   | "awaiting_confirmation"
   | "queued"
-  | "oms_preparing"
-  | "oms_snapshot"
-  | "oms_submitting"
-  | "oms_disabled"
-  | "inventory_resolving"
   | "reading_snapshot"
   | "temp_submitting"
   | "temp_verified"
   | "restoring"
+  | "pattern_preparing"
+  | "pattern_submitting"
+  | "pattern_verifying"
   | "final_verifying"
-  | "subsidy_preparing"
-  | "subsidy_template_ready"
-  | "subsidy_submitting"
-  | "subsidy_verified"
   | "succeeded"
   | "paused"
   | "needs_manual_review"
@@ -31,12 +32,50 @@ export interface ItemInput {
   expectedSkuCount?: number;
 }
 
+export interface PatternSkuInput {
+  sourceRow: number;
+  specification: string;
+  color: string;
+  price: string;
+  quantity: number;
+  merchantCode: string;
+  barcode: string;
+  remark: string;
+}
+
+export interface AddPatternItemInput {
+  itemId: string;
+  rows: PatternSkuInput[];
+}
+
+export interface PatternImportRow extends PatternSkuInput {
+  itemId: string;
+}
+
+export interface PatternImportPreview {
+  items: AddPatternItemInput[];
+  rows: PatternImportRow[];
+  valid: boolean;
+  canSubmit: boolean;
+  errors: string[];
+  warnings: string[];
+  sheetName: string;
+  requestedCount: number;
+}
+
 export interface TaskRecord {
   id: string;
   batchId: string;
+  operation?: TaskOperation;
   itemId: string;
   skuIds: string[];
   expectedSkuCount?: number;
+  patternRows?: PatternSkuInput[];
+  addedSkuIds?: string[];
+  existingSkuIds?: string[];
+  existingCount?: number;
+  additionCount?: number;
+  patternPropertyKeys?: { specificationKey: string; colorKey: string };
   mode: Mode;
   status: TaskStatus;
   phaseLabel: string;
@@ -44,16 +83,18 @@ export interface TaskRecord {
   attempts: number;
   errorCode?: string;
   errorMessage?: string;
+  channelOption?: ChannelOption;
+  channelOptionObserved?: string;
+  channelOptionSource?: string;
+  channelMigrationRequired?: boolean;
   liveWriteStarted?: boolean;
-  omsWriteStarted?: boolean;
-  subsidyWriteStarted?: boolean;
   writePhase?: string;
-  omsSnapshot?: { recordCount: number; changedRecordIds: string[] };
-  omsReadback?: { phase: string; recordCount: number };
-  inventoryDigest?: string;
-  inventoryMappings?: InventoryMapping[];
+  detailVariant?: Record<string, unknown>;
+  recoverySnapshot?: Record<string, unknown>;
+  snapshotBefore?: Record<string, unknown>;
+  snapshotAfter?: Record<string, unknown>;
+  fieldComparison?: Record<string, unknown>;
   skuMappings?: SkuMapping[];
-  subsidy?: { matchedRows: number; workbookSha256: string };
   oldSkuIds?: string[];
   newSkuIds?: string[];
   createdAt: string;
@@ -70,6 +111,7 @@ export interface TimelineEntry {
 
 export interface BatchRecord {
   id: string;
+  operation?: TaskOperation;
   mode: Mode;
   confirmation: boolean;
   itemCount: number;
@@ -79,32 +121,14 @@ export interface BatchRecord {
   taskIds: string[];
 }
 
-export interface InventoryHealth {
-  configured: boolean;
-  mode?: "remote_api" | "http" | "mysql" | "missing" | "invalid";
-  database?: string;
-  table?: string;
-  queryUrl?: string;
-  apiUrl?: string;
-  message?: string;
-}
-
-export interface InventoryMapping {
-  materialNo: string;
-  barcode?: string;
-  subMaterialName: string;
-  specification: string;
-}
-
-export interface SkuMapping extends InventoryMapping {
+export interface SkuMapping {
   oldSkuId: string;
   newSkuId: string;
 }
 
 export interface WorkflowHealth {
   configured: boolean;
-  missing: Array<"sku_rebuild" | "inventory" | "subsidy">;
-  configPath?: string | null;
+  missing: Array<"sku_rebuild" | "add_pattern">;
 }
 
 export interface WorkerHealth {
@@ -114,10 +138,6 @@ export interface WorkerHealth {
   browser: "hidden" | "visible" | "stopped" | "unavailable";
   profile: string;
   loggedIn: boolean;
-  omsLoggedIn?: boolean;
-  subsidyLoggedIn?: boolean;
-  inventory?: InventoryHealth;
-  subsidy?: { configured: boolean; enabled: boolean };
   workflow?: WorkflowHealth;
   riskRequired?: boolean;
   contract: "demo" | "configured" | "missing";
@@ -125,6 +145,7 @@ export interface WorkerHealth {
   currentUrl?: string;
   webdriver?: boolean | null;
   unresolvedLiveWrites?: number;
+  liveBatchConcurrency?: number;
 }
 
 export interface AuditRecord {
@@ -135,6 +156,14 @@ export interface AuditRecord {
   method: string;
   path: string;
   status?: number;
+  durationMs?: number;
+  elapsedMs?: number;
+  attempts?: number;
+  deadlineMs?: number;
+  deadlineReadback?: boolean;
+  strategy?: string;
+  transport?: string;
+  polling?: string;
   businessCode?: string;
   requestId: string;
   at: string;

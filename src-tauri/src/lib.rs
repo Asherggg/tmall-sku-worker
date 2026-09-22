@@ -1,19 +1,106 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::Mutex,
 };
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
 use tauri::{Manager, State};
 
-struct WorkerProcess(Mutex<Option<Child>>);
+#[cfg(target_os = "windows")]
+struct WorkerJob {
+    handle: isize,
+}
+
+#[cfg(target_os = "windows")]
+impl WorkerJob {
+    fn new() -> Result<Self, String> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JobObjectExtendedLimitInformation,
+        };
+
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                return Err(format!(
+                    "Unable to create Worker job object: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+            let configured = SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if configured == 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = CloseHandle(handle);
+                return Err(format!("Unable to configure Worker job object: {error}"));
+            }
+
+            Ok(Self {
+                handle: handle as isize,
+            })
+        }
+    }
+
+    fn assign(&self, child: &Child) -> Result<(), String> {
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        unsafe {
+            if AssignProcessToJobObject(self.handle as HANDLE, child.as_raw_handle() as HANDLE) == 0
+            {
+                return Err(format!(
+                    "Unable to attach Worker to its job object: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WorkerJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+
+        unsafe {
+            let _ = CloseHandle(self.handle as HANDLE);
+        }
+    }
+}
+
+struct ManagedWorker {
+    child: Child,
+    #[cfg(target_os = "windows")]
+    _job: WorkerJob,
+}
+
+impl ManagedWorker {
+    fn stop(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+struct WorkerProcess(Mutex<Option<ManagedWorker>>);
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
         if let Ok(mut worker) = self.0.lock() {
-            if let Some(mut child) = worker.take() {
-                let _ = child.kill();
-                let _ = child.wait();
+            if let Some(worker) = worker.take() {
+                worker.stop();
             }
         }
     }
@@ -25,39 +112,6 @@ struct HostStatus {
     worker_running: bool,
     worker_port: u16,
     app_data_dir: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-struct BundledRuntimeConfig {
-    inventory_api_token: String,
-}
-
-fn parse_inventory_token(raw: &str) -> Result<String, String> {
-    let values: BundledRuntimeConfig = serde_json::from_str(raw)
-        .map_err(|error| format!("Bundled runtime configuration is invalid: {error}"))?;
-    let token = values.inventory_api_token.trim();
-    if token.is_empty() {
-        return Err("Bundled runtime configuration has no inventory token".to_string());
-    }
-    Ok(token.to_string())
-}
-
-fn bundled_inventory_token(app: &tauri::AppHandle) -> Result<String, String> {
-    if let Some(path) = bundled_file(app, "runtime/default-runtime-config.json") {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|error| format!("Unable to read bundled runtime configuration: {error}"))?;
-        return parse_inventory_token(&raw);
-    }
-    if let Ok(token) = std::env::var("INVENTORY_API_TOKEN") {
-        if !token.trim().is_empty() {
-            return Ok(token);
-        }
-    }
-    let fallback = runtime_config_file(app)?;
-    let raw = std::fs::read_to_string(fallback)
-        .map_err(|_| "Bundled inventory credential was not found".to_string())?;
-    parse_inventory_token(&raw)
 }
 
 fn bundled_file(app: &tauri::AppHandle, relative: &str) -> Option<PathBuf> {
@@ -115,11 +169,7 @@ fn worker_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map(|path| path.join("worker"))
 }
 
-fn runtime_config_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    worker_data_dir(app).map(|path| path.join("runtime-config.json"))
-}
-
-fn spawn_worker(app: &tauri::AppHandle) -> Result<Child, String> {
+fn spawn_worker(app: &tauri::AppHandle) -> Result<ManagedWorker, String> {
     let script = worker_script(app);
     if !script.exists() {
         return Err(format!("Worker script not found: {}", script.display()));
@@ -128,8 +178,6 @@ fn spawn_worker(app: &tauri::AppHandle) -> Result<Child, String> {
     let app_data = worker_data_dir(app)?;
     std::fs::create_dir_all(&app_data)
         .map_err(|error| format!("Unable to create worker data directory: {error}"))?;
-    let runtime_config = app_data.join("runtime-config.json");
-    let inventory_api_token = bundled_inventory_token(app)?;
 
     let node = worker_node(app);
     let live_enabled = std::env::var("TMALL_LIVE_ENABLED").unwrap_or_else(|_| "true".to_string());
@@ -139,8 +187,6 @@ fn spawn_worker(app: &tauri::AppHandle) -> Result<Child, String> {
     command
         .arg(script)
         .env("TMALL_DATA_DIR", &app_data)
-        .env("TMALL_RUNTIME_CONFIG", runtime_config)
-        .env("INVENTORY_API_TOKEN", inventory_api_token)
         .env("TMALL_WORKER_PORT", "19828")
         .env("TMALL_LIVE_ENABLED", live_enabled)
         .env("TMALL_LIVE_CONTRACT", live_contract)
@@ -154,9 +200,25 @@ fn spawn_worker(app: &tauri::AppHandle) -> Result<Child, String> {
         command.creation_flags(0x08000000);
     }
 
-    command
+    #[cfg(target_os = "windows")]
+    let job = WorkerJob::new()?;
+
+    let mut child = command
         .spawn()
-        .map_err(|error| format!("Unable to start Node worker: {error}"))
+        .map_err(|error| format!("Unable to start Node worker: {error}"))?;
+
+    #[cfg(target_os = "windows")]
+    if let Err(error) = job.assign(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    Ok(ManagedWorker {
+        child,
+        #[cfg(target_os = "windows")]
+        _job: job,
+    })
 }
 
 #[tauri::command]
@@ -169,7 +231,8 @@ fn host_status(
         .lock()
         .map_err(|_| "Worker lock poisoned".to_string())?;
     let worker_running = match worker.as_mut() {
-        Some(child) => child
+        Some(worker) => worker
+            .child
             .try_wait()
             .map_err(|error| error.to_string())?
             .is_none(),
@@ -192,9 +255,8 @@ fn restart_worker(app: tauri::AppHandle, state: State<'_, WorkerProcess>) -> Res
         .0
         .lock()
         .map_err(|_| "Worker lock poisoned".to_string())?;
-    if let Some(mut child) = worker.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+    if let Some(worker) = worker.take() {
+        worker.stop();
     }
     *worker = Some(spawn_worker(&app)?);
     Ok(())
@@ -220,24 +282,5 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![host_status, restart_worker])
         .run(tauri::generate_context!())
-        .expect("error while running Tmall SKU Worker");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bundled_inventory_token_parses_without_exposing_other_values() {
-        let token =
-            parse_inventory_token(r#"{"INVENTORY_API_TOKEN":"test-token","OTHER":"ignored"}"#)
-                .expect("configuration should be valid");
-        assert_eq!(token, "test-token");
-    }
-
-    #[test]
-    fn bundled_inventory_token_is_required() {
-        assert!(parse_inventory_token(r#"{"INVENTORY_API_TOKEN":""}"#).is_err());
-        assert!(parse_inventory_token("{}").is_err());
-    }
+        .expect("error while running Tmall Operations Workbench");
 }

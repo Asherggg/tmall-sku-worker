@@ -1,14 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildAddPatternForm,
   buildSubmitBody,
   classifySubmitResponse,
   compareSkuRows,
   detectPublishVariant,
+  executeTmallAddPattern,
   executeTmallRebuild,
   extractServerFormFromHtml,
+  finalReadbackDelayForAttempt,
+  truncateReadbackHtmlAtModel,
   mergeServerForm,
   normalizeChannelOption,
+  resolveTaskChannelOption,
   summarizeForm,
 } from "../worker/tmall-live-adapter.mjs";
 
@@ -83,7 +88,10 @@ function defaultSalePropMeta() {
   };
 }
 
-function bootstrapHtml(form, salePropMeta = defaultSalePropMeta(), globalItemId = form.id) {
+function bootstrapHtml(form, salePropMeta = defaultSalePropMeta(), globalItemId = form.id, channelOptions = [
+  { value: "1", text: "纯电商(只有线上销售)" },
+  { value: "2", text: "商场同款(线上线下商场都销售)" },
+]) {
   const global = {
     value: {
       id: globalItemId,
@@ -102,7 +110,10 @@ function bootstrapHtml(form, salePropMeta = defaultSalePropMeta(), globalItemId 
     globalExtendInfo: "{\"mock\":true}",
   };
   const payload = {
-    components: { saleProp: { props: { subItems: salePropMeta } } },
+    components: {
+      saleProp: { props: { subItems: salePropMeta } },
+      channelOption: { props: { dataSource: channelOptions } },
+    },
     models: { formValues: form, global },
   };
   return `<html><script>window.Json = ${JSON.stringify(payload)}; window.noIcmpJson = {};</script></html>`;
@@ -129,9 +140,11 @@ class MockTmallPage {
   url() { return this._url; }
 
   context() {
+    const request = { fetch: (url, init) => this.#apiFetch(url, init) };
+    if (this.options.streamFetch) request.streamFetch = this.options.streamFetch;
     return {
       cookies: async () => [{ name: "XSRF-TOKEN", value: "mock-xsrf" }],
-      request: { fetch: (url, init) => this.#apiFetch(url, init) },
+      request,
     };
   }
 
@@ -170,7 +183,7 @@ class MockTmallPage {
     const parsedUrl = new URL(url);
     if (method === "GET" && parsedUrl.pathname === "/tmall/publish.htm") {
       this.getCount += 1;
-      let html = bootstrapHtml(this.serverForm, this.salePropMeta, this.globalItemId);
+      let html = bootstrapHtml(this.serverForm, this.salePropMeta, this.globalItemId, this.options.channelOptions);
       if (this.submitCount > 0 && this.options.fastReadbackHtml) {
         html = typeof this.options.fastReadbackHtml === "function"
           ? this.options.fastReadbackHtml(this.serverForm, this.salePropMeta, this.globalItemId, { getCount: this.getCount, submitCount: this.submitCount })
@@ -191,8 +204,15 @@ class MockTmallPage {
     }
     if (method === "POST" && parsedUrl.pathname === "/tmall/asyncOpt.htm") return this.#previewResponse(init, url);
     if (method === "POST" && parsedUrl.pathname === "/tmall/submit.htm") {
-      const body = new URLSearchParams(init.data);
-      return this.#submit(JSON.parse(body.get("jsonBody")), url);
+      const tracker = this.options.submitTracker;
+      tracker?.start();
+      try {
+        if (this.options.submitDelayMs) await new Promise((resolve) => setTimeout(resolve, this.options.submitDelayMs));
+        const body = new URLSearchParams(init.data);
+        return this.#submit(JSON.parse(body.get("jsonBody")), url);
+      } finally {
+        tracker?.end();
+      }
     }
     throw new Error(`unexpected API request: ${method} ${url}`);
   }
@@ -220,7 +240,13 @@ class MockTmallPage {
       return this.#response(url, 200, JSON.stringify({ models: { formError: { sku: { message: [{ code: "CHK_SKU_PARAM_REQUIRED_ERROR", msg: "缺少 SKU 参数" }] } } } }));
     }
     let savedRows = clone(submitted.sku);
-    if (this.submitCount === 1) {
+    if (this.options.assignMissingSkuIds) {
+      const ids = this.options.addedIds || ["7125801697539"];
+      let addedIndex = 0;
+      savedRows = savedRows.map((row) => /^\d+$/.test(String(row.skuId || ""))
+        ? row
+        : { ...row, skuId: ids[addedIndex++] });
+    } else if (this.submitCount === 1) {
       const ids = this.options.temporaryIds || ["6125801697539", "6125801697540"];
       savedRows = savedRows.map((row, index) => ({ ...row, skuId: ids[index] }));
     } else if (this.options.finalStockDelta) {
@@ -246,17 +272,71 @@ function task(overrides = {}) {
   };
 }
 
-test("channel option preserves the live page value and ignores environment overrides", () => {
+function patternTask(rows, overrides = {}) {
+  return {
+    id: "pattern-task-1",
+    itemId: ITEM_ID,
+    operation: "add_pattern",
+    patternRows: rows,
+    ...overrides,
+  };
+}
+
+const existingPatternRow = (overrides = {}) => ({
+  sourceRow: 2,
+  specification: "1.5米床",
+  color: "云影微澜",
+  price: "2388.00",
+  quantity: 0,
+  merchantCode: "134460",
+  barcode: "6942399076300",
+  remark: "原花型不增加新规格",
+  ...overrides,
+});
+
+const addedPatternRow = (overrides = {}) => ({
+  sourceRow: 3,
+  specification: "1.5米床",
+  color: "晨雾蓝",
+  price: "2499.00",
+  quantity: 3,
+  merchantCode: "234562",
+  barcode: "6942399076302",
+  remark: "新增花型",
+  ...overrides,
+});
+
+test("channel option preserves legal page values and requires migration for legacy values", () => {
   const previous = process.env.TMALL_CHANNEL_OPTION;
   process.env.TMALL_CHANNEL_OPTION = "1";
   try {
     assert.deepEqual(normalizeChannelOption({ channelOption: { value: "2" } }), { value: "2" });
-    assert.deepEqual(normalizeChannelOption({ channelOption: { value: "2" } }, "1"), { value: "1" });
-    assert.throws(() => normalizeChannelOption({ channelOption: { value: "5" } }), (error) => error.code === "channel_option_invalid");
+    assert.deepEqual(normalizeChannelOption({ channelOption: { value: "2" } }, "2"), { value: "2" });
+    assert.throws(() => normalizeChannelOption({ channelOption: { value: "2" } }, "1"), (error) => error.code === "channel_option_override_forbidden");
+    for (const value of ["5", "", null]) {
+      assert.throws(() => normalizeChannelOption({ channelOption: { value } }), (error) => error.code === "channel_option_migration_required");
+    }
+    assert.deepEqual(normalizeChannelOption({ channelOption: { value: "5" } }, "1"), { value: "1" });
+    assert.throws(() => normalizeChannelOption({ channelOption: { value: "5" } }, "5"), (error) => error.code === "channel_option_selection_invalid");
   } finally {
     if (previous == null) delete process.env.TMALL_CHANNEL_OPTION;
     else process.env.TMALL_CHANNEL_OPTION = previous;
   }
+});
+
+test("manual channel selection must appear exactly once in the current component", () => {
+  const form = makeForm();
+  form.channelOption = { value: "5" };
+  const taskInput = patternTask([addedPatternRow()], { channelOption: "1", channelOptionSource: "5" });
+  const state = { formValues: form, channelOptions: [{ value: "1", text: "纯电商" }, { value: "2", text: "商场同款" }] };
+  assert.deepEqual(resolveTaskChannelOption(state, taskInput), { value: "1" });
+  assert.equal(taskInput.channelOptionObserved, "5");
+  assert.throws(() => resolveTaskChannelOption({ ...state, channelOptions: [{ value: "2" }] }, taskInput), (error) => error.code === "channel_option_not_offered");
+  assert.throws(() => resolveTaskChannelOption({ ...state, channelOptions: [{ value: "1" }, { value: "1" }] }, taskInput), (error) => error.code === "channel_option_not_offered");
+  assert.throws(() => resolveTaskChannelOption({ ...state, formValues: { ...form, channelOption: { value: "" } } }, taskInput), (error) => error.code === "channel_option_source_changed");
+  assert.throws(() => resolveTaskChannelOption({ ...state, formValues: { ...form, channelOption: { value: "2" } } }, {
+    ...taskInput, channelOptionSource: undefined,
+  }), (error) => error.code === "channel_option_source_changed");
 });
 
 test("submit response rejects HTTP 200 form errors", () => {
@@ -300,6 +380,7 @@ test("server bootstrap parser extracts the form model without evaluating page co
   assert.equal(parsed.formValues.id, ITEM_ID);
   assert.equal(parsed.formValues.sku.length, 2);
   assert.equal(parsed.global.id, ITEM_ID);
+  assert.deepEqual(parsed.channelOptions.map((option) => option.value), ["1", "2"]);
 });
 
 test("server readback merges authoritative fields with runtime-only SKU metadata", () => {
@@ -348,6 +429,274 @@ test("form summary keeps active current and old IDs without request secrets", ()
   assert.equal(JSON.stringify(summary).includes("token"), false);
 });
 
+test("add-pattern planning preserves existing rows and creates only explicit missing combinations", () => {
+  const original = makeForm();
+  const plan = buildAddPatternForm(original, defaultSalePropMeta(), patternTask([
+    existingPatternRow(),
+    addedPatternRow(),
+  ]));
+  assert.equal(plan.existing.length, 1);
+  assert.equal(plan.additions.length, 1);
+  assert.equal(plan.formValues.sku.length, 3);
+  assert.deepEqual(plan.formValues.sku.slice(0, 2), original.sku);
+  const added = plan.additions[0].row;
+  assert.equal(added.skuId, null);
+  assert.equal(added.skuPrice, "2499.00");
+  assert.equal(added.skuStock, 3);
+  assert.equal(added.skuOuterId, "234562");
+  assert.equal(added.skuBarcode, "6942399076302");
+  assert.equal(added.props.find((prop) => prop.name === "p-1627207").text, "晨雾蓝");
+  assert.equal(plan.formValues.saleProp["p-1627207"].some((value) => value.text === "晨雾蓝"), true);
+});
+
+test("add-pattern maps equivalent dimension spelling to existing and offered values", () => {
+  const form = makeForm();
+  for (const row of form.sku) {
+    row.props = row.props.map((prop) => prop.name === "p-5569827" ? { ...prop, text: "150X210CM" } : prop);
+  }
+  form.saleProp["p-5569827"] = [{ value: -1001, text: "150X210CM" }];
+  const meta = defaultSalePropMeta();
+  meta["p-5569827"].dataSource = [
+    { value: 32005284901, text: "150X210CM" },
+    { value: 32005284902, text: "180x220cm" },
+  ];
+  const plan = buildAddPatternForm(form, meta, patternTask([
+    existingPatternRow({ specification: "150cm×210cm" }),
+    addedPatternRow({ specification: "180cm×220cm" }),
+  ]));
+  assert.equal(plan.existing.length, 1);
+  assert.equal(plan.additions.length, 1);
+  const specification = plan.additions[0].row.props.find((prop) => prop.name === "p-5569827");
+  assert.equal(specification.value, 32005284902);
+  assert.equal(specification.text, "180x220cm");
+});
+
+test("dimension equivalence does not collapse range or thickness differences", () => {
+  for (const testCase of [
+    { current: "180cmX（范围200-220）cm", requested: "180cm×200cm" },
+    { current: "100*200cm", requested: "100cm×200cm×5cm" },
+  ]) {
+    const form = makeForm();
+    for (const row of form.sku) {
+      row.props = row.props.map((prop) => prop.name === "p-5569827" ? { ...prop, text: testCase.current } : prop);
+    }
+    form.saleProp["p-5569827"] = [{ value: -1001, text: testCase.current }];
+    const meta = defaultSalePropMeta();
+    meta["p-5569827"].dataSource = [{ value: 32005284901, text: testCase.current }];
+    assert.throws(() => buildAddPatternForm(form, meta, patternTask([
+      addedPatternRow({ specification: testCase.requested }),
+    ])), (error) => error.code === "pattern_custom_value_unsupported");
+  }
+});
+
+test("add-pattern builds newMeasurement structItems and mirrors SKU-detail parameters", () => {
+  const form = makeForm();
+  const currentStructItems = {
+    "ts-1": "7",
+    "ts-2": "-",
+    "ts-3": "8",
+    "ts-4": { text: "cm", value: 5 },
+  };
+  for (const row of form.sku) {
+    row.props = row.props.map((prop) => prop.name === "p-5569827"
+      ? { name: "p-250292780", value: -26128408, text: "7-8cm", structItems: clone(currentStructItems) }
+      : prop);
+    row["skuParam_p-250292780"] = { value: 26128408, text: "7-8cm", structItems: clone(currentStructItems) };
+  }
+  delete form.saleProp["p-5569827"];
+  form.saleProp["p-250292780"] = [{ value: -26128408, text: "7-8cm", structItems: clone(currentStructItems) }];
+  const meta = {
+    "p-250292780": {
+      name: "p-250292780",
+      label: "高度",
+      uiType: "newMeasurement",
+      isMeasurement: true,
+      maxLength: 100,
+      maxCustomItems: 9999,
+      dataSource: [{ value: -26128408, text: "7-8cm", structItems: clone(currentStructItems) }],
+      structItems: [
+        { name: "ts-1", uiType: "input", pattern: "([1-9][0-9]{0,9}|[0-9])(\\.[0-9]{0,4})?" },
+        { name: "ts-2", uiType: "text", value: "-" },
+        { name: "ts-3", uiType: "input", pattern: "([1-9][0-9]{0,9}|[0-9])(\\.[0-9]{0,4})?" },
+        { name: "ts-4", uiType: "select", dataSource: [{ value: 1, text: "m" }, { value: 4, text: "dm" }, { value: 5, text: "cm" }] },
+      ],
+    },
+    "p-1627207": defaultSalePropMeta()["p-1627207"],
+  };
+  const plan = buildAddPatternForm(form, meta, patternTask([
+    addedPatternRow({ specification: "10-12cm" }),
+  ]));
+  assert.equal(plan.propertyKeys.specificationKey, "p-250292780");
+  const added = plan.additions[0].row;
+  const prop = added.props.find((entry) => entry.name === "p-250292780");
+  const skuParam = added["skuParam_p-250292780"];
+  assert.deepEqual(prop.structItems, {
+    "ts-1": "10",
+    "ts-2": "-",
+    "ts-3": "12",
+    "ts-4": { text: "cm", value: 5 },
+  });
+  assert.deepEqual(skuParam.structItems, prop.structItems);
+  assert.equal(String(skuParam.value), String(prop.value).replace(/^-/, ""));
+  assert.throws(() => buildAddPatternForm(form, meta, patternTask([
+    addedPatternRow({ specification: "10到12cm" }),
+  ])), (error) => error.code === "pattern_measurement_value_invalid");
+});
+
+test("add-pattern existing-only input completes without preview or submit", async () => {
+  const page = new MockTmallPage();
+  const result = await executeTmallAddPattern(page, patternTask([existingPatternRow()]));
+  assert.equal(result.writeAttempted, false);
+  assert.equal(result.existingCount, 1);
+  assert.equal(result.additionCount, 0);
+  assert.deepEqual(result.addedSkuIds, []);
+  assert.equal(page.submitCount, 0);
+  assert.equal(page.getCount, 1);
+  assert.equal(page.apiCalls.filter((entry) => entry.method === "POST").length, 0);
+});
+
+test("add-pattern submits once, retains original SKU IDs, and reads back the new ID", async () => {
+  const page = new MockTmallPage(makeForm(), { assignMissingSkuIds: true, addedIds: ["7125801697539"] });
+  const phases = [];
+  const readbacks = [];
+  const result = await executeTmallAddPattern(page, patternTask([
+    existingPatternRow(),
+    addedPatternRow(),
+  ]), {
+    onPhase(entry) { phases.push(entry.phase); },
+    onReadback(entry) { readbacks.push(entry); },
+  });
+
+  assert.equal(page.submitCount, 1);
+  assert.equal(page.getCount, 2);
+  assert.equal(result.writeAttempted, true);
+  assert.equal(result.existingCount, 1);
+  assert.equal(result.additionCount, 1);
+  assert.deepEqual(result.addedSkuIds, ["7125801697539"]);
+  assert.deepEqual([...result.existingSkuIds].sort(), ["5757013487113", "5757013487114"]);
+  assert.equal(result.comparison.equal, true);
+  assert.deepEqual(phases, ["reading_snapshot", "pattern_preparing", "pattern_submitting", "pattern_verifying", "pattern_verifying"]);
+  assert.equal(readbacks[0].deadlineMs, 150_000);
+  assert.equal(readbacks[0].settled, true);
+  const submitted = page.submittedForms[0];
+  assert.deepEqual(submitted.sku.slice(0, 2).map((row) => row.skuId), ["5757013487113", "5757013487114"]);
+  assert.equal(submitted.sku[2].skuId, null);
+  assert.equal(page.gotoCalls.length, 0);
+  assert.equal(page.reloadCalls, 0);
+  assert.equal(page.waitForUrlCalls, 0);
+});
+
+test("add-pattern accepts platform preview fields while preserving every original field", async () => {
+  const page = new MockTmallPage(makeForm(), {
+    assignMissingSkuIds: true,
+    addedIds: ["7125801697539"],
+    previewRows(rows) {
+      return rows.map((row, index) => ({
+        ...row,
+        platformPreviewMetadata: { generated: true, index },
+      }));
+    },
+  });
+  const result = await executeTmallAddPattern(page, patternTask([
+    existingPatternRow(),
+    addedPatternRow(),
+  ]));
+  assert.equal(result.comparison.equal, true);
+  assert.equal(page.submitCount, 1);
+  assert.deepEqual(page.submittedForms[0].sku.slice(0, 2).map((row) => row.skuId), ["5757013487113", "5757013487114"]);
+  assert.ok(page.submittedForms[0].sku.every((row) => row.platformPreviewMetadata?.generated === true));
+});
+
+test("legacy and empty channels block before any POST, including existing-only input", async () => {
+  for (const value of ["5", ""]) {
+    const form = makeForm();
+    form.channelOption = { value };
+    for (const rows of [[existingPatternRow()], [addedPatternRow()]]) {
+      const page = new MockTmallPage(form);
+      const currentTask = patternTask(rows);
+      await assert.rejects(executeTmallAddPattern(page, currentTask), (error) => (
+        error.code === "channel_option_migration_required" && error.observedValue === value
+      ));
+      assert.equal(currentTask.channelOptionObserved, value);
+      assert.equal(page.getCount, 1);
+      assert.equal(page.submitCount, 0);
+      assert.equal(page.apiCalls.filter((entry) => entry.method === "POST").length, 0);
+    }
+    const rebuildPage = new MockTmallPage(form);
+    await assert.rejects(executeTmallRebuild(rebuildPage, task()), (error) => error.code === "channel_option_migration_required");
+    assert.equal(rebuildPage.apiCalls.filter((entry) => entry.method === "POST").length, 0);
+  }
+});
+
+test("explicit channel migration submits once and verifies the selected value in fresh server readback", async () => {
+  for (const [legacy, selected] of [["5", "1"], ["", "2"]]) {
+    const form = makeForm();
+    form.channelOption = { value: legacy };
+    const page = new MockTmallPage(form, { assignMissingSkuIds: true });
+    const currentTask = patternTask([addedPatternRow()], { channelOption: selected, channelOptionSource: legacy });
+    const snapshots = [];
+    const result = await executeTmallAddPattern(page, currentTask, { onRecoverySnapshot(value) { snapshots.push(value); } });
+    assert.equal(result.comparison.equal, true);
+    assert.equal(page.submitCount, 1);
+    assert.equal(page.getCount, 2);
+    assert.equal(page.submittedForms[0].channelOption.value, selected);
+    assert.equal(page.serverForm.channelOption.value, selected);
+    assert.equal(snapshots[0].channelOption.value, legacy);
+    assert.equal(snapshots[0].plannedChannelOption.value, selected);
+    assert.deepEqual(result.oldSkuIds, ["5757013487113", "5757013487114"]);
+    assert.deepEqual(result.addedSkuIds, ["7125801697539"]);
+  }
+});
+
+test("existing-only channel selection leaves the legacy channel unchanged", async () => {
+  const form = makeForm();
+  form.channelOption = { value: "5" };
+  const page = new MockTmallPage(form);
+  const snapshots = [];
+  const result = await executeTmallAddPattern(page, patternTask([existingPatternRow()], {
+    channelOption: "1", channelOptionSource: "5",
+  }), { onSnapshot(value) { snapshots.push(value); } });
+  assert.equal(result.writeAttempted, false);
+  assert.deepEqual(snapshots.map((entry) => entry.summary.channelOption), ["5", "5"]);
+  assert.equal(page.serverForm.channelOption.value, "5");
+  assert.equal(page.apiCalls.filter((entry) => entry.method === "POST").length, 0);
+});
+
+test("selected channel unavailable in current component fails before preview and submit", async () => {
+  const form = makeForm();
+  form.channelOption = { value: "5" };
+  const page = new MockTmallPage(form, { channelOptions: [{ value: "2", text: "商场同款" }] });
+  await assert.rejects(executeTmallAddPattern(page, patternTask([addedPatternRow()], {
+    channelOption: "1", channelOptionSource: "5",
+  })), (error) => error.code === "channel_option_not_offered");
+  assert.equal(page.apiCalls.filter((entry) => entry.method === "POST").length, 0);
+});
+
+test("legal current channels remain unchanged even with environment override", async () => {
+  const previous = process.env.TMALL_CHANNEL_OPTION;
+  process.env.TMALL_CHANNEL_OPTION = "1";
+  try {
+    const page = new MockTmallPage(makeForm(), { assignMissingSkuIds: true });
+    const result = await executeTmallAddPattern(page, patternTask([addedPatternRow()]));
+    assert.equal(result.comparison.equal, true);
+    assert.equal(page.submittedForms[0].channelOption.value, "2");
+    assert.equal(page.serverForm.channelOption.value, "2");
+  } finally {
+    if (previous == null) delete process.env.TMALL_CHANNEL_OPTION;
+    else process.env.TMALL_CHANNEL_OPTION = previous;
+  }
+});
+
+test("add-pattern blocks an existing-field mismatch before any write", async () => {
+  const page = new MockTmallPage();
+  await assert.rejects(
+    executeTmallAddPattern(page, patternTask([existingPatternRow({ price: "9999.00" })])),
+    (error) => error.code === "pattern_existing_field_mismatch",
+  );
+  assert.equal(page.submitCount, 0);
+  assert.equal(page.apiCalls.filter((entry) => entry.method === "POST").length, 0);
+});
+
 test("detects SKU-detail pages and preserves required skuParam fields", async () => {
   const form = makeForm();
   form.sku[1].props = clone(form.sku[0].props);
@@ -390,6 +739,10 @@ test("pure API two-phase rebuild matches reversed preview rows without page navi
   assert.equal(page.gotoCalls.length, 0);
   assert.equal(page.getCount, 3);
   assert.deepEqual([...result.newSkuIds].sort(), ["6125801697539", "6125801697540"]);
+  assert.deepEqual(result.skuMappings, [
+    { oldSkuId: "5757013487113", newSkuId: "6125801697539" },
+    { oldSkuId: "5757013487114", newSkuId: "6125801697540" },
+  ]);
   assert.equal(result.comparison.equal, true);
 
   const submitCalls = page.apiCalls.filter((entry) => new URL(entry.url).pathname === "/tmall/submit.htm");
@@ -406,6 +759,8 @@ test("pure API two-phase rebuild matches reversed preview rows without page navi
   assert.equal(temporary.saleProp["p-5569827"].every((value) => value.text.length <= 30), true);
   assert.equal(temporary.sku.every((row) => !row.salePropKey.includes("---")), true);
   assert.deepEqual(page.submittedForms[1].saleProp, makeForm().saleProp);
+  assert.deepEqual(page.submittedForms[1].sku.map((row) => row.skuOuterId), makeForm().sku.map((row) => row.skuOuterId));
+  assert.deepEqual(page.submittedForms[1].sku.map((row) => row.skuBarcode), makeForm().sku.map((row) => row.skuBarcode));
   assert.deepEqual(page.submittedForms[1].sku.map((row) => row.skuPicture), makeForm().sku.map((row) => row.skuPicture));
 });
 
@@ -457,7 +812,7 @@ test("two-phase rebuild uses API server bootstrap readback only", async () => {
   assert.equal(page.submitCount, 2);
   assert.equal(page.waitForUrlCalls, 0);
   assert.deepEqual(readbacks.map((entry) => entry.strategy), ["api_server_bootstrap", "api_server_bootstrap"]);
-  assert.ok(readbacks.every((entry) => entry.settled === true && entry.attempts === 1));
+  assert.ok(readbacks.every((entry) => entry.transport === "browser_context_request"));
   assert.equal(page.gotoCalls.length, 0);
   assert.equal(result.comparison.equal, true);
 });
@@ -496,6 +851,133 @@ test("final readback accepts platform convergence at 109 seconds within the 150-
   assert.equal(finalReadback.settled, true);
   assert.equal(finalReadback.deadlineMs, 150_000);
   assert.ok(finalReadback.durationMs >= 109_000 && finalReadback.durationMs < 150_000);
+});
+
+test("readback transport can stop after the server model without changing parsed data", async () => {
+  const form = makeForm();
+  const html = bootstrapHtml(form);
+  const partial = truncateReadbackHtmlAtModel(html);
+  assert.equal(partial.truncated, true);
+  assert.equal(extractServerFormFromHtml(partial.html).formValues.id, ITEM_ID);
+  assert.equal(extractServerFormFromHtml(partial.html).formValues.sku.length, form.sku.length);
+  assert.equal(truncateReadbackHtmlAtModel("<html>no model</html>").truncated, false);
+});
+
+test("live readbacks can use the model-stream transport and keep the strict checks", async () => {
+  const streamCalls = [];
+  const page = new MockTmallPage(makeForm(), {
+    streamFetch: async (url, init) => {
+      streamCalls.push({ url, headers: init.headers });
+      return new Response(bootstrapHtml(page.serverForm, page.salePropMeta, page.globalItemId), { status: 200 });
+    },
+  });
+  const readbacks = [];
+  const result = await executeTmallRebuild(page, task(), {
+    readbackTiming: { streamHtml: true },
+    onReadback(entry) { readbacks.push(entry); },
+  });
+  assert.equal(result.comparison.equal, true);
+  assert.equal(streamCalls.length, 2);
+  assert.ok(streamCalls.every((entry) => entry.headers.Cookie.includes("XSRF-TOKEN=mock-xsrf")));
+  assert.ok(readbacks.every((entry) => entry.transport === "node_fetch_stream_until_model"));
+});
+
+test("final readback uses an aggressive early backoff without changing the hard deadline", async () => {
+  assert.deepEqual(
+    [1, 2, 3, 4, 5, 6, 7, "invalid"].map((attempt) => finalReadbackDelayForAttempt(attempt)),
+    [500, 1_000, 2_000, 4_000, 8_000, 10_000, 10_000, 500],
+  );
+  let clock = 0;
+  const readbacks = [];
+  const page = new MockTmallPage(makeForm(), {
+    fastReadbackHtml(form, salePropMeta, itemId, context) {
+      const stale = clone(form);
+      if (context.submitCount === 2 && clock < 25_000) stale.sku[0].skuTitle = "平台仍在收敛";
+      return bootstrapHtml(stale, salePropMeta, itemId);
+    },
+  });
+  const result = await executeTmallRebuild(page, task(), {
+    readbackTiming: {
+      now: () => clock,
+      sleep: async (delayMs) => { clock += delayMs; },
+    },
+    onReadback(entry) { readbacks.push(entry); },
+  });
+  const finalReadback = readbacks.find((entry) => entry.phase === "final_readback");
+  assert.equal(result.comparison.equal, true);
+  assert.equal(finalReadback.settled, true);
+  assert.equal(finalReadback.attempts, 7);
+  assert.equal(finalReadback.durationMs, 25_500);
+  assert.equal(page.getCount, 9);
+});
+
+test("phase callbacks expose non-sensitive phase and elapsed timing", async () => {
+  const phases = [];
+  await executeTmallRebuild(new MockTmallPage(), task(), { onPhase(entry) { phases.push(entry); } });
+  assert.deepEqual(phases.map((entry) => entry.phase), [
+    "reading_snapshot", "temp_submitting", "temp_verified", "restoring", "final_verifying",
+  ]);
+  assert.ok(phases.every((entry) => Number.isFinite(entry.durationMs) && entry.durationMs >= 0));
+  assert.ok(phases.every((entry) => Number.isFinite(entry.elapsedMs) && entry.elapsedMs >= entry.durationMs));
+});
+
+test("optional write lock serializes submit calls while allowing independent read phases", async () => {
+  let tail = Promise.resolve();
+  let activeSubmits = 0;
+  let maxActiveSubmits = 0;
+  const submitTracker = {
+    start() {
+      activeSubmits += 1;
+      maxActiveSubmits = Math.max(maxActiveSubmits, activeSubmits);
+    },
+    end() { activeSubmits -= 1; },
+  };
+  const withWriteLock = (operation) => {
+    const previous = tail;
+    let release;
+    tail = new Promise((resolve) => { release = resolve; });
+    return previous.then(async () => {
+      try { return await operation(); } finally { release(); }
+    });
+  };
+  const first = new MockTmallPage(makeForm("742063162901"), { submitTracker, submitDelayMs: 20 });
+  const second = new MockTmallPage(makeForm("742063162902"), { submitTracker, submitDelayMs: 20 });
+  await Promise.all([
+    executeTmallRebuild(first, task({ id: "task-a", itemId: "742063162901" }), { withWriteLock }),
+    executeTmallRebuild(second, task({ id: "task-b", itemId: "742063162902" }), { withWriteLock }),
+  ]);
+  assert.equal(maxActiveSubmits, 1);
+  assert.equal(activeSubmits, 0);
+  assert.equal(first.submitCount, 2);
+  assert.equal(second.submitCount, 2);
+});
+test("final readback performs a fresh GET when an in-flight response crosses the deadline", async () => {
+  let clock = 0;
+  let crossed = false;
+  const readbacks = [];
+  const page = new MockTmallPage(makeForm(), {
+    fastReadbackHtml(form, salePropMeta, itemId, context) {
+      const stale = clone(form);
+      if (context.submitCount === 2 && !crossed) {
+        crossed = true;
+        clock = 150_001;
+        stale.sku[0].skuTitle = "平台仍在收敛";
+      }
+      return bootstrapHtml(stale, salePropMeta, itemId);
+    },
+  });
+  const result = await executeTmallRebuild(page, task(), {
+    readbackTiming: {
+      now: () => clock,
+      sleep: async (delayMs) => { clock += delayMs; },
+    },
+    onReadback(entry) { readbacks.push(entry); },
+  });
+  const finalReadback = readbacks.find((entry) => entry.phase === "final_readback");
+  assert.equal(result.comparison.equal, true);
+  assert.equal(finalReadback.attempts, 2);
+  assert.equal(finalReadback.deadlineReadback, true);
+  assert.equal(page.getCount, 4);
 });
 
 test("final readback performs one fresh GET at the 150-second deadline before manual review", async () => {

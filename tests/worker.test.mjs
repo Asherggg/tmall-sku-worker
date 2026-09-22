@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isLoggedInUrl, isOmsSessionReady, isSubsidySessionReady } from "../worker/browser-url.mjs";
+import { isLoggedInUrl, isRiskPage } from "../worker/browser-url.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -109,71 +109,57 @@ test("health starts in safe demo mode", async () => {
   assert.equal(path.basename(health.profile), "edge-profile-v2");
   assert.equal(health.riskRequired, false);
   assert.equal(health.webdriver, null);
+  assert.equal(health.liveBatchConcurrency, 2);
 });
 
-test("live health reports exact missing workflow configuration", async () => {
+test("live health requires only the SKU rebuild contract", async () => {
   const isolatedPort = await availablePort();
   const isolatedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmall-worker-config-test-"));
   let isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, {
     TMALL_LIVE_ENABLED: "true",
-    TMALL_LIVE_CONTRACT: "tmall-publish-v2",
-    TMALL_RUNTIME_CONFIG: path.join(isolatedDataDir, "runtime-config.json"),
+    TMALL_LIVE_CONTRACT: "",
   });
   try {
     await waitForWorkerAt(isolatedPort);
     const missing = await (await fetch(`http://127.0.0.1:${isolatedPort}/health`)).json();
-    assert.equal(missing.workerVersion, "0.1.23");
+    assert.equal(missing.workerVersion, "0.1.30");
     assert.equal(missing.contract, "missing");
-    assert.deepEqual(missing.workflow.missing, ["inventory"]);
-    assert.match(missing.message, /Doris 商品资料访问令牌/);
-    assert.doesNotMatch(missing.message, /国补流程开关|OMS/);
-    assert.equal(missing.inventory.apiUrl, "http://10.21.16.213:9031/v1/materials/lookup");
-    assert.equal(missing.subsidy.configured, true);
-    assert.equal(missing.workflow.configPath, path.join(isolatedDataDir, "runtime-config.json"));
+    assert.deepEqual(missing.workflow.missing, ["sku_rebuild", "add_pattern"]);
+    assert.match(missing.message, /天猫商品写入契约未配置/);
+    assert.equal(Object.hasOwn(missing, "inventory"), false);
+    assert.equal(Object.hasOwn(missing, "subsidy"), false);
+    assert.equal(Object.hasOwn(missing, "omsLoggedIn"), false);
 
     await stopWorker(isolatedChild);
     isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, {
       TMALL_LIVE_ENABLED: "true",
       TMALL_LIVE_CONTRACT: "tmall-publish-v2",
-      TMALL_RUNTIME_CONFIG: path.join(isolatedDataDir, "runtime-config.json"),
-      INVENTORY_API_TOKEN: "test-token",
     });
     await waitForWorkerAt(isolatedPort);
     const configured = await (await fetch(`http://127.0.0.1:${isolatedPort}/health`)).json();
     assert.equal(configured.contract, "configured");
-    assert.equal(configured.inventory.configured, true);
-    assert.equal(configured.inventory.apiUrl, "http://10.21.16.213:9031/v1/materials/lookup");
-    assert.equal(configured.subsidy.configured, true);
     assert.deepEqual(configured.workflow.missing, []);
+    assert.equal(configured.message, "SKU ID 重建与新增花型流程已配置");
   } finally {
     await stopWorker(isolatedChild);
     fs.rmSync(isolatedDataDir, { recursive: true, force: true });
   }
 });
 
-test("seller, OMS, and subsidy login signals are classified without business writes", () => {
+test("clean worker does not expose removed workflow endpoints", async () => {
+  for (const endpoint of ["/inventory/health", "/inventory/lookup", "/browser/oms", "/browser/subsidy"]) {
+    const response = await fetch(`http://127.0.0.1:${port}${endpoint}`, { method: endpoint === "/inventory/health" ? "GET" : "POST" });
+    assert.equal(response.status, 404, endpoint);
+  }
+});
+
+test("seller login and risk signals are classified", () => {
   assert.equal(isLoggedInUrl("https://sell.publish.tmall.com/tmall/publish.htm?id=1"), true);
   assert.equal(isLoggedInUrl("https://myseller.taobao.com/home.htm/SellManage/all?current=1"), true);
   assert.equal(isLoggedInUrl("https://myseller.taobao.com/login.htm"), false);
   assert.equal(isLoggedInUrl("https://login.taobao.com/member/login.jhtml"), false);
-  assert.equal(isOmsSessionReady({
-    url: "https://oms.shuixing.com/#/platformCommodity",
-    bodyText: "全渠道订单中心 商品 平台商品 查询",
-    tokenPresent: true,
-  }), true);
-  assert.equal(isOmsSessionReady({
-    url: "https://oms.shuixing.com/#/platformCommodity",
-    bodyText: "全渠道订单中心 商品 平台商品 查询",
-    tokenPresent: false,
-  }), false);
-  assert.equal(isSubsidySessionReady({
-    url: "https://myseller.taobao.com/home.htm/gov-subsidy/goods-manage",
-    bodyText: "国家补贴 商品管理 新增/更新国补商品",
-  }), true);
-  assert.equal(isSubsidySessionReady({
-    url: "https://myseller.taobao.com/home.htm/gov-subsidy/goods-manage?verify=true",
-    bodyText: "安全验证",
-  }), false);
+  assert.equal(isRiskPage("https://myseller.taobao.com/home.htm/verify", "安全验证"), true);
+  assert.equal(isRiskPage("https://myseller.taobao.com/home.htm/SellManage/all", "商品管理"), false);
 });
 
 test("demo batch runs item tasks and creates synthetic readback IDs", async () => {
@@ -188,6 +174,84 @@ test("demo batch runs item tasks and creates synthetic readback IDs", async () =
   assert.equal(task.status, "succeeded");
   assert.equal(task.newSkuIds.length, 2);
   assert.equal(task.progress, 100);
+});
+
+test("add-pattern demo batches persist normalized Excel rows and can be filtered", async () => {
+  const create = await fetch(`http://127.0.0.1:${port}/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      operation: "add_pattern",
+      mode: "demo",
+      items: [{
+        itemId: "819488060800",
+        rows: [{
+          sourceRow: 2,
+          specification: "150cm×210cm",
+          color: "新花型",
+          price: "899",
+          quantity: 1,
+          merchantCode: "NEW-523673",
+          barcode: "6923283207999",
+          remark: "新增",
+        }],
+      }],
+    }),
+  });
+  assert.equal(create.status, 201);
+  const created = await create.json();
+  assert.equal(created.tasks[0].operation, "add_pattern");
+  assert.equal(created.tasks[0].patternRows[0].price, "899.00");
+  const task = await waitForTask(created.tasks[0].id, (entry) => entry.status === "succeeded");
+  assert.equal(task.addedSkuIds.length, 1);
+  assert.match(task.timeline.at(-1).message, /1 条 Excel 组合/);
+
+  const patternTasks = await (await fetch(`http://127.0.0.1:${port}/tasks?operation=add_pattern`)).json();
+  assert.equal(patternTasks.tasks.some((entry) => entry.id === task.id), true);
+  assert.equal(patternTasks.tasks.every((entry) => entry.operation === "add_pattern"), true);
+  const rebuildTasks = await (await fetch(`http://127.0.0.1:${port}/tasks?operation=sku_rebuild`)).json();
+  assert.equal(rebuildTasks.tasks.some((entry) => entry.id === task.id), false);
+});
+
+test("add-pattern live mode requires its own explicit confirmation phrase", async () => {
+  const item = {
+    itemId: "819488060801",
+    rows: [{ sourceRow: 2, specification: "150cm", color: "新花型", price: "99.00", quantity: 0, merchantCode: "NEW-1", barcode: "", remark: "" }],
+  };
+  const wrong = await fetch(`http://127.0.0.1:${port}/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ operation: "add_pattern", mode: "live", confirmation: "确认线上重建", items: [item] }),
+  });
+  assert.equal(wrong.status, 400);
+  const accepted = await fetch(`http://127.0.0.1:${port}/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ operation: "add_pattern", mode: "live", confirmation: "确认线上新增花型", items: [item] }),
+  });
+  assert.equal(accepted.status, 201);
+});
+
+test("add-pattern rows are rejected before queueing when fields or combinations are invalid", async () => {
+  const response = await fetch(`http://127.0.0.1:${port}/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      operation: "add_pattern",
+      mode: "demo",
+      items: [{
+        itemId: "819488060802",
+        rows: [
+          { sourceRow: 2, specification: "150cm", color: "花型", price: "99", quantity: 1, merchantCode: "A", barcode: "", remark: "" },
+          { sourceRow: 3, specification: "150cm", color: "花型", price: "99", quantity: 1, merchantCode: "A", barcode: "", remark: "" },
+        ],
+      }],
+    }),
+  });
+  assert.equal(response.status, 400);
+  const payload = await response.json();
+  assert.equal(payload.error, "validation_error");
+  assert.ok(payload.errors.some((message) => message.includes("组合重复")));
 });
 
 test("live mode requires the explicit confirmation phrase", async () => {
@@ -358,6 +422,73 @@ test("retry runs only the queued task and does not replay sibling manual-review 
   assert.equal(untouched.attempts, 1);
 });
 
+test("legacy channel tasks require a per-task explicit selection and confirmation before retry", async () => {
+  const isolatedPort = await availablePort();
+  const isolatedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmall-worker-migration-test-"));
+  const createdAt = new Date().toISOString();
+  const makeTask = (id, errorCode, observed) => ({
+    id, batchId: "migration_batch", operation: "add_pattern", itemId: id === "legacy_task" ? "10070" : "10071",
+    skuIds: [], patternRows: [], mode: "live", status: "needs_manual_review", errorCode,
+    ...(observed !== undefined ? { channelOptionObserved: observed } : {}),
+    liveWriteStarted: false, attempts: 1, progress: 0, createdAt, updatedAt: createdAt, timeline: [],
+  });
+  fs.writeFileSync(path.join(isolatedDataDir, "state.json"), `${JSON.stringify({
+    batches: [{ id: "migration_batch", mode: "live", operation: "add_pattern", status: "failed", taskIds: ["legacy_task", "typed_task"], createdAt }],
+    tasks: [makeTask("legacy_task", "channel_option_invalid"), makeTask("typed_task", "channel_option_migration_required", "")],
+    audit: [], browser: {},
+  })}\n`, "utf8");
+  const isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, { TMALL_LIVE_ENABLED: "false" });
+  const url = `http://127.0.0.1:${isolatedPort}`;
+  const retry = (id, payload = {}) => fetch(`${url}/tasks/${id}/retry`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
+  });
+  try {
+    await waitForWorkerAt(isolatedPort);
+    const initial = await (await fetch(`${url}/tasks/typed_task`)).json();
+    assert.equal(initial.attempts, 1);
+    const missing = await retry("typed_task");
+    assert.equal(missing.status, 409);
+    assert.equal((await missing.json()).error, "channel_migration_required");
+    for (const channelOption of ["5", "", "3"]) {
+      const rejected = await retry("typed_task", { channelOption, confirmChannelMigration: true });
+      assert.equal(rejected.status, 409);
+    }
+    const unconfirmed = await retry("typed_task", { channelOption: "2" });
+    assert.equal(unconfirmed.status, 409);
+    assert.equal((await unconfirmed.json()).error, "channel_migration_confirmation_required");
+    const typedBefore = await (await fetch(`${url}/tasks/typed_task`)).json();
+    assert.equal(typedBefore.attempts, 1);
+    assert.equal(typedBefore.channelOption, undefined);
+    const accepted = await retry("typed_task", { channelOption: "2", confirmChannelMigration: true });
+    assert.equal(accepted.status, 202);
+    const typed = await waitForTask("typed_task", (entry) => entry.attempts === 2 && entry.status === "needs_manual_review", isolatedPort);
+    assert.equal(typed.channelOption, "2");
+    assert.equal(typed.channelOptionSource, "");
+    assert.equal(typed.liveWriteStarted, false);
+    assert.equal((await retry("typed_task", { channelOption: "1" })).status, 409);
+    const legacy = await retry("legacy_task", { channelOption: "1", confirmChannelMigration: true });
+    assert.equal(legacy.status, 202);
+    const retried = await waitForTask("legacy_task", (entry) => entry.attempts === 2 && entry.status === "needs_manual_review", isolatedPort);
+    assert.equal(retried.channelOption, "1");
+    assert.equal(retried.channelOptionSource, undefined);
+    const audit = await (await fetch(`${url}/audit/export`)).json();
+    assert.equal(audit.records.filter((entry) => entry.method === "POST" && entry.path.includes("submit.htm")).length, 0);
+  } finally {
+    await stopWorker(isolatedChild);
+    fs.rmSync(isolatedDataDir, { recursive: true, force: true });
+  }
+});
+
+test("new batch inputs cannot smuggle a channel selection", async () => {
+  const response = await fetch(`http://127.0.0.1:${port}/tasks`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode: "demo", operation: "add_pattern", items: [{
+      itemId: "10072", channelOption: "1", rows: [{ sourceRow: 2, specification: "尺寸", color: "花型", price: "1.00", quantity: 1 }],
+    }] }),
+  });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).errors.join(" "), /销售渠道只能在任务读取旧值后人工选择/);
+});
 test("an unresolved live write survives restart and locks the item", async () => {
   const isolatedPort = await availablePort();
   const isolatedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmall-worker-lock-test-"));

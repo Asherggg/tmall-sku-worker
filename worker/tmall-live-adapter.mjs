@@ -4,11 +4,18 @@ const PUBLISH_PATH = "/tmall/submit.htm";
 const ASYNC_OPT = "/tmall/asyncOpt.htm";
 const PUBLISH_ORIGIN = "https://sell.publish.tmall.com";
 const VALID_CHANNEL_OPTIONS = new Set(["1", "2"]);
+const CHANNEL_OPTION_LABELS = Object.freeze({ "1": "纯电商", "2": "商场同款" });
 const PUBLISH_PAGE_PATH = "/tmall/publish.htm";
 const TEMP_READBACK_ATTEMPTS = 6;
 const FINAL_READBACK_TIMEOUT_MS = 150_000;
 const TEMP_READBACK_DELAY_MS = 500;
-const FINAL_READBACK_DELAY_MS = 2_000;
+const FINAL_READBACK_BACKOFF_MS = [500, 1_000, 2_000, 4_000, 8_000, 10_000];
+
+export function finalReadbackDelayForAttempt(attempt) {
+  const numericAttempt = Number(attempt);
+  const index = Number.isFinite(numericAttempt) ? Math.max(0, Math.floor(numericAttempt) - 1) : 0;
+  return FINAL_READBACK_BACKOFF_MS[Math.min(index, FINAL_READBACK_BACKOFF_MS.length - 1)];
+}
 
 function clone(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -62,6 +69,20 @@ function collectDataSourceValueIds(value, output = []) {
   return output;
 }
 
+function collectDataSourceValues(value, output = []) {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectDataSourceValues(entry, output);
+  } else if (value && typeof value === "object") {
+    const text = primitive(value.text ?? value.label ?? value.name);
+    const optionValue = primitive(value.value ?? value.id);
+    if (text && optionValue) output.push({ ...clone(value), text, value: value.value ?? value.id });
+    if (value.dataSource) collectDataSourceValues(value.dataSource, output);
+    if (value.options) collectDataSourceValues(value.options, output);
+    if (value.children) collectDataSourceValues(value.children, output);
+  }
+  return output;
+}
+
 function normalizeSalePropMeta(rawSubItems) {
   const entries = Array.isArray(rawSubItems)
     ? rawSubItems.map((item) => [primitive(item?.key || item?.name || item?.propName || item?.dataIndex), item])
@@ -73,11 +94,14 @@ function normalizeSalePropMeta(rawSubItems) {
     required: item?.required === true,
     hasCustomProp: item?.hasCustomProp === true,
     isCustomSelectSaleProp: item?.isCustomSelectSaleProp === true,
+    isMeasurement: item?.isMeasurement === true || primitive(item?.uiType || item?.type) === "newMeasurement",
+    structItems: Array.isArray(item?.structItems) ? clone(item.structItems) : [],
     checkUrl: primitive(item?.checkUrl),
     propertyId: primitive(item?.propertyId) || primitive(mapKey).replace(/^p-/, ""),
     maxCustomItems: Number.isFinite(Number(item?.maxCustomItems)) ? Number(item.maxCustomItems) : null,
     maxLength: Number.isFinite(Number(item?.maxLength)) ? Number(item.maxLength) : null,
     dataSourceValueIds: [...new Set(collectDataSourceValueIds(item?.dataSource))],
+    dataSourceValues: [...new Map(collectDataSourceValues(item?.dataSource).map((value) => [`${String(value.value)}\u0000${value.text}`, value])).values()],
   }));
 }
 
@@ -163,6 +187,9 @@ export function extractServerFormFromHtml(html) {
     formValues,
     global,
     salePropMeta: root?.components?.saleProp?.props?.subItems || null,
+    channelOptions: Array.isArray(root?.components?.channelOption?.props?.dataSource)
+      ? root.components.channelOption.props.dataSource.map((option) => ({ value: String(option?.value ?? ""), text: String(option?.text ?? "") }))
+      : [],
   };
 }
 
@@ -390,17 +417,79 @@ function assertItemIdentity(state, pageUrl, itemId) {
   }
 }
 
+function channelOptionValue(value) {
+  const candidate = typeof value === "object" ? value?.value : value;
+  return String(candidate ?? "");
+}
+
+export function inspectChannelOption(formValues) {
+  const rawValue = channelOptionValue(formValues?.channelOption);
+  return {
+    rawValue,
+    valid: VALID_CHANNEL_OPTIONS.has(rawValue),
+    label: CHANNEL_OPTION_LABELS[rawValue] || null,
+  };
+}
+
+function channelOptionMigrationError(rawValue) {
+  const displayed = rawValue || "空值";
+  const error = new Error(`销售渠道为旧值 ${displayed}，请人工选择 1（纯电商）或 2（商场同款）后重试`);
+  error.code = "channel_option_migration_required";
+  error.status = 409;
+  error.observedValue = rawValue;
+  error.allowedValues = ["1", "2"];
+  return error;
+}
+
+function invalidChannelSelectionError(value) {
+  const error = new Error(`人工选择的销售渠道无效: ${value || "空"}，只允许 1 或 2`);
+  error.code = "channel_option_selection_invalid";
+  error.status = 400;
+  error.allowedValues = ["1", "2"];
+  return error;
+}
+
 export function normalizeChannelOption(formValues, explicit) {
-  const current = formValues?.channelOption?.value ?? formValues?.channelOption;
-  const value = explicit == null || explicit === "" ? current : explicit;
-  const normalized = typeof value === "object" ? value?.value : value;
-  const result = String(normalized ?? "");
-  if (!VALID_CHANNEL_OPTIONS.has(result)) {
-    const error = new Error(`销售渠道值无效: ${result || "空"}，只允许 1 或 2`);
-    error.code = "channel_option_invalid";
+  const inspected = inspectChannelOption(formValues);
+  const hasExplicit = explicit !== undefined && explicit !== null && explicit !== "";
+  if (!hasExplicit) {
+    if (inspected.valid) return { value: inspected.rawValue };
+    throw channelOptionMigrationError(inspected.rawValue);
+  }
+  const selected = channelOptionValue(explicit);
+  if (!VALID_CHANNEL_OPTIONS.has(selected)) throw invalidChannelSelectionError(selected);
+  if (inspected.valid && selected !== inspected.rawValue) {
+    const error = new Error(`线上销售渠道已经是 ${inspected.rawValue}（${inspected.label}），不能改为 ${selected}`);
+    error.code = "channel_option_override_forbidden";
+    error.status = 409;
+    error.observedValue = inspected.rawValue;
+    error.selectedValue = selected;
     throw error;
   }
-  return { value: result };
+  return { value: selected };
+}
+
+export function resolveTaskChannelOption(state, task) {
+  const observed = inspectChannelOption(state?.formValues);
+  task.channelOptionObserved = observed.rawValue;
+  const selected = task?.channelOption;
+  if (selected !== undefined) {
+    if ((task.channelOptionSource !== undefined && task.channelOptionSource !== observed.rawValue)
+      || (observed.valid && selected !== observed.rawValue)) {
+      const error = new Error("线上销售渠道与人工选择时的旧值不一致，请重新核对并选择");
+      error.code = "channel_option_source_changed";
+      error.observedValue = observed.rawValue;
+      throw error;
+    }
+    const options = state?.channelOptions || [];
+    if (options.filter((option) => option.value === selected).length !== 1) {
+      const error = new Error(`当次页面未唯一提供所选销售渠道 ${selected}，未发出写请求`);
+      error.code = "channel_option_not_offered";
+      error.observedValue = observed.rawValue;
+      throw error;
+    }
+  }
+  return normalizeChannelOption(state.formValues, selected);
 }
 
 export function classifySubmitResponse(status, bodyText) {
@@ -452,35 +541,6 @@ export function summarizeForm(formValues) {
     sku: rows.map(skuIdentity),
     salePropKeys: Object.keys(formValues?.saleProp || {}),
   };
-}
-
-function inventoryMappingFromRow(row, resolved) {
-  return {
-    materialNo: String(resolved?.materialNo ?? row?.skuOuterId ?? "").trim(),
-    barcode: String(resolved?.barcode ?? "").trim() || String(row?.skuBarcode ?? "").trim(),
-    subMaterialName: String(resolved?.subMaterialName ?? "").trim(),
-    specification: String(resolved?.specification ?? "").trim(),
-  };
-}
-
-function applyInventoryResolution(formValues, resolution) {
-  const rows = activeRows(formValues?.sku);
-  const resolvedRows = Array.isArray(resolution?.rows) ? resolution.rows : Array.isArray(resolution) ? resolution : [];
-  if (resolvedRows.length !== rows.length) {
-    throw Object.assign(new Error(`Doris 返回 ${resolvedRows.length} 条 SKU 资料，预期 ${rows.length} 条`), { code: "inventory_resolution_count_mismatch" });
-  }
-  const mappings = rows.map((row, index) => {
-    const mapping = inventoryMappingFromRow(row, resolvedRows[index]);
-    if (!mapping.materialNo || !mapping.subMaterialName || !mapping.specification) {
-      throw Object.assign(new Error(`SKU ${positiveSkuId(row?.skuId) || index + 1} 缺少料号、品名或规格资料`), { code: "inventory_resolution_incomplete", index });
-    }
-    if (!mapping.barcode && !String(row?.skuBarcode ?? "").trim()) {
-      throw Object.assign(new Error(`SKU ${positiveSkuId(row?.skuId) || index + 1} 缺少可用 69 码`), { code: "inventory_barcode_missing", index, materialNo: mapping.materialNo });
-    }
-    if (!String(row?.skuBarcode ?? "").trim() && mapping.barcode) row.skuBarcode = mapping.barcode;
-    return mapping;
-  });
-  return mappings;
 }
 
 function uniqueToken(task) {
@@ -606,7 +666,55 @@ function requestContext(page) {
   return context;
 }
 
-async function apiFetch(page, url, { method = "GET", body = null, headers = {}, timeout = 45_000 } = {}) {
+export function truncateReadbackHtmlAtModel(html) {
+  const source = String(html || "");
+  const modelIndex = source.indexOf("window.Json");
+  const markerIndex = modelIndex >= 0 ? source.indexOf("window.noIcmpJson", modelIndex) : -1;
+  if (markerIndex < 0) return { html: source, truncated: false };
+  return {
+    html: `${source.slice(0, markerIndex)}window.noIcmpJson = {};</script>`,
+    truncated: true,
+  };
+}
+
+async function streamReadbackResponse(url, headers, timeout, fetchImplementation = globalThis.fetch) {
+  if (typeof fetchImplementation !== "function") throw new Error("流式回读传输不可用");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetchImplementation(url, { method: "GET", headers, signal: controller.signal });
+    if (!response.body) return { status: response.status, text: await response.text(), url: response.url, transport: "node_fetch_full" };
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    let truncated = false;
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        text += decoder.decode();
+        break;
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+      const model = truncateReadbackHtmlAtModel(text);
+      if (model.truncated) {
+        text = model.html;
+        truncated = true;
+        await reader.cancel();
+        break;
+      }
+    }
+    return {
+      status: response.status,
+      text,
+      url: response.url,
+      transport: truncated ? "node_fetch_stream_until_model" : "node_fetch_full",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function apiFetch(page, url, { method = "GET", body = null, headers = {}, timeout = 45_000, streamHtml = false } = {}) {
   const context = requestContext(page);
   const requestHeaders = {
     Accept: method === "GET" ? "text/html,application/xhtml+xml" : "application/json, text/plain, */*",
@@ -622,6 +730,15 @@ async function apiFetch(page, url, { method = "GET", body = null, headers = {}, 
     try { xsrfToken = decodeURIComponent(encodedToken); } catch {}
     if (xsrfToken) requestHeaders["X-XSRF-TOKEN"] = xsrfToken;
   }
+  if (streamHtml && method === "GET") {
+    const cookies = await context.cookies(PUBLISH_ORIGIN);
+    const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+    try {
+      return await streamReadbackResponse(url, { ...requestHeaders, Cookie: cookieHeader }, timeout, context.request.streamFetch || globalThis.fetch);
+    } catch {
+      // Keep the BrowserContext transport as the read-only fallback if undici cannot stream.
+    }
+  }
   const response = await context.request.fetch(url, {
     method,
     headers: requestHeaders,
@@ -629,15 +746,24 @@ async function apiFetch(page, url, { method = "GET", body = null, headers = {}, 
     timeout,
     failOnStatusCode: false,
   });
-  return { status: response.status(), text: await response.text(), url: response.url() };
+  return { status: response.status(), text: await response.text(), url: response.url(), transport: "browser_context_request" };
 }
 
-async function fetchServerReadback(page, baseUrl) {
-  const result = await apiFetch(page, baseUrl);
+async function fetchServerReadback(page, baseUrl, { streamHtml = false } = {}) {
+  let result = await apiFetch(page, baseUrl, { streamHtml });
   if (result.status < 200 || result.status >= 300) {
     throw Object.assign(new Error(`服务端回读 HTTP ${result.status}`), { code: "server_readback_http_error", status: result.status });
   }
-  return { ...extractServerFormFromHtml(result.text), status: result.status };
+  try {
+    return { ...extractServerFormFromHtml(result.text), status: result.status, transport: result.transport || "browser_context_request" };
+  } catch (error) {
+    if (!streamHtml || result.transport !== "node_fetch_stream_until_model") throw error;
+    result = await apiFetch(page, baseUrl, { streamHtml: false });
+    if (result.status < 200 || result.status >= 300) {
+      throw Object.assign(new Error(`服务端回读 HTTP ${result.status}`), { code: "server_readback_http_error", status: result.status });
+    }
+    return { ...extractServerFormFromHtml(result.text), status: result.status, transport: "browser_context_request_after_stream_fallback" };
+  }
 }
 
 async function fetchInitialState(page, baseUrl) {
@@ -652,6 +778,7 @@ async function fetchInitialState(page, baseUrl) {
     ready: true,
     formValues,
     global: parsed.global,
+    channelOptions: parsed.channelOptions || [],
     channelData: null,
     salePropMeta: normalizeSalePropMeta(parsed.salePropMeta),
     detailVariant: detectPublishVariant(formValues, normalizeSalePropMeta(parsed.salePropMeta)),
@@ -663,9 +790,9 @@ async function loadReadback(page, baseUrl, fallbackState, phase, accepts, timing
   const sleep = typeof timing.sleep === "function"
     ? timing.sleep
     : (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs));
-  const finalReadbackDelayMs = Number.isFinite(Number(timing.finalDelayMs)) && Number(timing.finalDelayMs) > 0
+  const finalReadbackDelayOverride = Number.isFinite(Number(timing.finalDelayMs)) && Number(timing.finalDelayMs) > 0
     ? Number(timing.finalDelayMs)
-    : FINAL_READBACK_DELAY_MS;
+    : null;
   const startedAt = now();
   const finalDeadlineAt = startedAt + FINAL_READBACK_TIMEOUT_MS;
   const finalPhase = phase === "final_readback";
@@ -673,16 +800,18 @@ async function loadReadback(page, baseUrl, fallbackState, phase, accepts, timing
   let lastState = null;
   let lastError = null;
   while (finalPhase || attempt < TEMP_READBACK_ATTEMPTS) {
-    const deadlineReadback = finalPhase && now() >= finalDeadlineAt;
+    const deadlineReadbackAtStart = finalPhase && now() >= finalDeadlineAt;
     attempt += 1;
     try {
-      const parsed = await fetchServerReadback(page, baseUrl);
+      const parsed = await fetchServerReadback(page, baseUrl, { streamHtml: timing.streamHtml === true });
       const salePropMeta = normalizeSalePropMeta(parsed.salePropMeta) || fallbackState?.salePropMeta || [];
       const mergedForm = mergeServerForm(fallbackState?.formValues, parsed.formValues);
+      const reachedDeadline = finalPhase && now() >= finalDeadlineAt;
       lastState = {
         ready: true,
         formValues: mergedForm,
         global: mergeServerGlobal(fallbackState?.global, parsed.global),
+        channelOptions: parsed.channelOptions || fallbackState?.channelOptions || [],
         channelData: null,
         salePropMeta,
         detailVariant: detectPublishVariant(mergedForm, salePropMeta),
@@ -693,9 +822,11 @@ async function loadReadback(page, baseUrl, fallbackState, phase, accepts, timing
           status: parsed.status,
           durationMs: now() - startedAt,
           strategy: "api_server_bootstrap",
+          transport: parsed.transport,
+          polling: finalPhase ? (finalReadbackDelayOverride == null ? "adaptive_backoff" : "fixed_override") : "fixed",
           attempts: attempt,
           settled: false,
-          ...(finalPhase ? { deadlineMs: FINAL_READBACK_TIMEOUT_MS, deadlineReadback } : {}),
+          ...(finalPhase ? { deadlineMs: FINAL_READBACK_TIMEOUT_MS, deadlineReadback: deadlineReadbackAtStart || reachedDeadline } : {}),
         },
       };
       if (!accepts || accepts(lastState)) {
@@ -706,9 +837,13 @@ async function loadReadback(page, baseUrl, fallbackState, phase, accepts, timing
       lastError = error;
     }
     if (finalPhase) {
-      if (deadlineReadback) break;
+      if (deadlineReadbackAtStart) break;
       const remainingMs = finalDeadlineAt - now();
-      if (remainingMs > 0) await sleep(Math.min(finalReadbackDelayMs, remainingMs));
+      if (remainingMs <= 0) continue;
+      if (remainingMs > 0) {
+        const delayMs = finalReadbackDelayOverride ?? finalReadbackDelayForAttempt(attempt);
+        await sleep(Math.min(delayMs, remainingMs));
+      }
     } else {
       if (attempt >= TEMP_READBACK_ATTEMPTS) break;
       await sleep(TEMP_READBACK_DELAY_MS);
@@ -792,7 +927,7 @@ async function previewSalePropValues(page, formValues, global) {
   return { endpoint, status: result.status, rows };
 }
 
-function mergePreviewRows(desiredRows, previewRows) {
+function mergePreviewRows(desiredRows, previewRows, { preserveIdentities = false } = {}) {
   if (!Array.isArray(previewRows) || !previewRows.length) {
     throw Object.assign(new Error("销售属性预检未返回 SKU 组合"), { code: "sale_prop_preview_count_mismatch", expected: desiredRows.length, actual: previewRows?.length || 0 });
   }
@@ -855,9 +990,9 @@ function mergePreviewRows(desiredRows, previewRows) {
       if (!preview) throw Object.assign(new Error(`销售属性预检缺少 SKU 明细: ${rowDetailIdentity(desired)}`), { code: "sale_prop_preview_mapping_failed" });
       const merged = { ...clone(preview), ...clone(desired) };
       merged.salePropKey = preview.salePropKey;
-      merged.skuId = null;
-      merged.skuOldSku = null;
-      merged.sourceSkuId = null;
+      merged.skuId = preserveIdentities ? (desired.skuId ?? null) : null;
+      merged.skuOldSku = preserveIdentities ? (desired.skuOldSku ?? null) : null;
+      merged.sourceSkuId = preserveIdentities ? (desired.sourceSkuId ?? null) : null;
       merged.skuPrice = desired.skuPrice;
       merged.skuStock = desired.skuStock;
       merged.skuOuterId = desired.skuOuterId;
@@ -872,7 +1007,7 @@ function mergePreviewRows(desiredRows, previewRows) {
 }
 
 function prewriteStateError(phase, reason) {
-  const label = phase === "temporary" ? "临时提交" : "最终恢复提交";
+  const label = phase === "temporary" ? "临时提交" : phase === "pattern" ? "新增花型提交" : "最终恢复提交";
   return Object.assign(new Error(`${label}前页内状态校验失败：${reason}`), {
     code: `${phase}_prewrite_state_mismatch`,
     phase,
@@ -973,6 +1108,548 @@ function validateFinalPrewrite(expectedForm, actualForm, generatedIds) {
   }
 }
 
+function normalizePatternMoney(value) {
+  const text = String(value ?? "").trim();
+  if (!/^(?:0|[1-9]\d{0,7})(?:\.\d{1,2})?$/.test(text) || Number(text) <= 0) return null;
+  const [integer, decimal = ""] = text.split(".");
+  return `${integer}.${decimal.padEnd(2, "0")}`;
+}
+
+function normalizePatternRows(task) {
+  const rows = Array.isArray(task?.patternRows) ? task.patternRows : [];
+  if (!rows.length || rows.length > 500) {
+    throw Object.assign(new Error("新增花型明细必须为 1 到 500 行"), { code: "pattern_rows_invalid" });
+  }
+  const combinations = new Set();
+  const merchantCodes = new Set();
+  return rows.map((input, index) => {
+    const sourceRow = Number(input?.sourceRow ?? index + 2);
+    const specification = String(input?.specification ?? "").trim();
+    const color = String(input?.color ?? "").trim();
+    const price = normalizePatternMoney(input?.price);
+    const quantity = Number(input?.quantity);
+    const merchantCode = String(input?.merchantCode ?? "").trim();
+    const barcode = String(input?.barcode ?? "").trim();
+    const remark = String(input?.remark ?? "").trim();
+    if (!Number.isInteger(sourceRow) || sourceRow < 2 || !specification || !color || !price
+      || !Number.isInteger(quantity) || quantity < 0 || quantity > 999_999_999
+      || merchantCode.length > 64 || barcode.length > 64 || specification.length > 200 || color.length > 200) {
+      throw Object.assign(new Error(`Excel 第 ${sourceRow || index + 2} 行字段无效`), { code: "pattern_row_invalid", sourceRow });
+    }
+    const combination = `${specification}\u0000${color}`;
+    if (combinations.has(combination)) {
+      throw Object.assign(new Error(`Excel 第 ${sourceRow} 行规格组合重复`), { code: "pattern_combination_duplicate", sourceRow });
+    }
+    combinations.add(combination);
+    if (merchantCode) {
+      if (merchantCodes.has(merchantCode)) {
+        throw Object.assign(new Error(`Excel 第 ${sourceRow} 行商家编码重复`), { code: "pattern_outer_id_duplicate", sourceRow });
+      }
+      merchantCodes.add(merchantCode);
+    }
+    return { sourceRow, specification, color, price, quantity, merchantCode, barcode, remark };
+  });
+}
+
+function patternPropText(row, key) {
+  const prop = (Array.isArray(row?.props) ? row.props : []).find((entry) => String(entry?.name) === String(key));
+  return String(prop?.text ?? "").trim();
+}
+
+function normalizeDimensionUnit(value) {
+  const unit = String(value || "").toLowerCase();
+  if (unit === "毫米") return "mm";
+  if (unit === "厘米" || unit === "公分") return "cm";
+  if (unit === "分米") return "dm";
+  if (unit === "米") return "m";
+  return unit;
+}
+
+function parseDimensionText(value) {
+  const compact = String(value ?? "")
+    .normalize("NFKC")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[×✕✖＊*]/g, "x");
+  const rawParts = compact.split("x");
+  if (rawParts.length < 2 || rawParts.length > 4 || rawParts.some((part) => !part)) return null;
+  const parts = [];
+  for (const part of rawParts) {
+    const match = part.match(/^(\d+(?:\.\d+)?)(mm|cm|dm|m|毫米|厘米|公分|分米|米)?$/i);
+    if (!match) return null;
+    const numeric = Number(match[1]);
+    if (!Number.isFinite(numeric)) return null;
+    parts.push({ number: String(numeric), unit: normalizeDimensionUnit(match[2]) });
+  }
+  return parts;
+}
+
+function specificationTextsEquivalent(left, right) {
+  const leftText = String(left ?? "").trim();
+  const rightText = String(right ?? "").trim();
+  if (leftText === rightText) return true;
+  const leftParts = parseDimensionText(leftText);
+  const rightParts = parseDimensionText(rightText);
+  if (!leftParts || !rightParts || leftParts.length !== rightParts.length) return false;
+  return leftParts.every((part, index) => {
+    const candidate = rightParts[index];
+    if (part.number !== candidate.number) return false;
+    if (part.unit === candidate.unit) return true;
+    return (!part.unit && candidate.unit === "cm") || (part.unit === "cm" && !candidate.unit);
+  });
+}
+
+function propertyLabelScore(label, kind) {
+  const text = String(label || "").trim();
+  if (kind === "color") {
+    if (text === "颜色分类") return 20;
+    if (/颜色|花色|花型|款式/.test(text)) return 12;
+    return 0;
+  }
+  if (/规格|尺寸|尺码|大小|适用|高度|宽度|长度|厚度/.test(text)) return 12;
+  return 0;
+}
+
+export function resolvePatternPropertyKeys(formValues, salePropMeta, requestedRows) {
+  const originalRows = activeRows(formValues?.sku);
+  const keys = Object.keys(formValues?.saleProp || {}).filter((key) => Array.isArray(formValues.saleProp[key]));
+  const metadata = new Map((Array.isArray(salePropMeta) ? salePropMeta : []).map((meta) => [String(meta?.key || ""), meta]));
+  const candidates = [];
+  for (const specificationKey of keys) {
+    for (const colorKey of keys) {
+      if (specificationKey === colorKey) continue;
+      const exactMatches = requestedRows.filter((input) => originalRows.some((row) => (
+        specificationTextsEquivalent(patternPropText(row, specificationKey), input.specification)
+        && patternPropText(row, colorKey) === input.color
+      ))).length;
+      const specificationValues = formValues.saleProp[specificationKey] || [];
+      const colorTexts = new Set((formValues.saleProp[colorKey] || []).map((value) => String(value?.text ?? "").trim()));
+      const specificationHits = new Set(requestedRows.filter((input) => specificationValues.some((value) => (
+        specificationTextsEquivalent(value?.text, input.specification)
+      ))).map((input) => input.specification)).size;
+      const colorHits = new Set(requestedRows.filter((input) => colorTexts.has(input.color)).map((input) => input.color)).size;
+      const specificationLabel = propertyLabelScore(metadata.get(specificationKey)?.label, "specification");
+      const colorLabel = propertyLabelScore(metadata.get(colorKey)?.label, "color");
+      if (!exactMatches && !specificationHits && !colorHits && !(specificationLabel && colorLabel)) continue;
+      const reversePenalty = propertyLabelScore(metadata.get(specificationKey)?.label, "color")
+        + propertyLabelScore(metadata.get(colorKey)?.label, "specification");
+      const score = (exactMatches * 10_000) + ((specificationHits + colorHits) * 100) + specificationLabel + colorLabel - reversePenalty;
+      candidates.push({ specificationKey, colorKey, score, exactMatches, specificationHits, colorHits });
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score || a.specificationKey.localeCompare(b.specificationKey) || a.colorKey.localeCompare(b.colorKey));
+  if (!candidates.length) {
+    throw Object.assign(new Error("无法从页面销售属性识别“规格”和“颜色分类”字段"), { code: "pattern_property_mapping_missing" });
+  }
+  if (candidates[1]?.score === candidates[0].score) {
+    throw Object.assign(new Error("页面销售属性存在多个同等匹配，无法唯一识别 Excel 字段"), {
+      code: "pattern_property_mapping_ambiguous",
+      candidates: candidates.slice(0, 2),
+    });
+  }
+  return candidates[0];
+}
+
+function findPatternValue(values, text, code, kind = "exact") {
+  const matches = (Array.isArray(values) ? values : []).filter((value) => {
+    const candidate = String(value?.text ?? "").trim();
+    return candidate === text || (kind === "specification" && specificationTextsEquivalent(candidate, text));
+  });
+  if (matches.length > 1) throw Object.assign(new Error(`销售属性文本“${text}”无法唯一映射`), { code });
+  return matches[0] || null;
+}
+
+function escapePatternRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseMeasurementStructItems(text, meta) {
+  const items = Array.isArray(meta?.structItems) ? meta.structItems : [];
+  if (!items.length) return null;
+  const descriptors = [];
+  const patternParts = [];
+  for (const item of items) {
+    const name = String(item?.name || "");
+    const uiType = String(item?.uiType || "");
+    if (!name) return null;
+    if (uiType === "input") {
+      patternParts.push("([0-9]+(?:\\.[0-9]{1,4})?)");
+      descriptors.push({ kind: "input", name, item });
+      continue;
+    }
+    if (uiType === "text") {
+      const literal = String(item?.value ?? item?.label ?? "");
+      if (!literal) return null;
+      patternParts.push(escapePatternRegex(literal.normalize("NFKC")));
+      descriptors.push({ kind: "text", name, value: literal });
+      continue;
+    }
+    if (uiType === "select") {
+      const options = [...new Map(collectDataSourceValues(item?.dataSource).map((option) => [String(option.text).toLowerCase(), option])).values()]
+        .sort((left, right) => String(right.text).length - String(left.text).length);
+      if (!options.length) return null;
+      patternParts.push(`(${options.map((option) => escapePatternRegex(String(option.text).normalize("NFKC"))).join("|")})`);
+      descriptors.push({ kind: "select", name, options });
+      continue;
+    }
+    return null;
+  }
+  const normalizedText = String(text ?? "").normalize("NFKC").trim();
+  const matcher = new RegExp(`^\\s*${patternParts.join("\\s*")}\\s*$`, "i");
+  const match = matcher.exec(normalizedText);
+  if (!match) return null;
+  const structItems = {};
+  let captureIndex = 1;
+  for (const descriptor of descriptors) {
+    if (descriptor.kind === "text") {
+      structItems[descriptor.name] = descriptor.value;
+      continue;
+    }
+    const captured = String(match[captureIndex++] || "").trim();
+    if (descriptor.kind === "input") {
+      const configuredPattern = String(descriptor.item?.pattern || "");
+      if (configuredPattern) {
+        try {
+          if (!new RegExp(`^(?:${configuredPattern})$`).test(captured)) return null;
+        } catch {
+          return null;
+        }
+      }
+      structItems[descriptor.name] = captured;
+      continue;
+    }
+    const option = descriptor.options.find((entry) => String(entry.text).normalize("NFKC").toLowerCase() === captured.normalize("NFKC").toLowerCase());
+    if (!option) return null;
+    structItems[descriptor.name] = { text: String(option.text), value: option.value };
+  }
+  return structItems;
+}
+
+function patternCustomValueId(task, key, text, usedValueIds) {
+  const seed = crypto.createHash("sha256").update(`${task.id}:${task.itemId}:${key}:${text}`).digest("hex").slice(0, 8);
+  let value = -(100_000_000 + (Number.parseInt(seed, 16) % 800_000_000));
+  while (usedValueIds.has(String(value))) value -= 1;
+  usedValueIds.add(String(value));
+  return value;
+}
+
+function ensurePatternValue(formValues, metadata, key, text, task, customValuesByKey, kind = "exact") {
+  const values = formValues.saleProp[key];
+  const existing = findPatternValue(values, text, "pattern_property_text_ambiguous", kind);
+  if (existing) return existing;
+  const meta = metadata.get(key);
+  if (!meta) throw Object.assign(new Error(`销售属性 ${key} 缺少页面元数据`), { code: "pattern_property_metadata_missing", key });
+  const optionMatches = (meta.dataSourceValues || []).filter((value) => {
+    const candidate = String(value?.text ?? "").trim();
+    return candidate === text || (kind === "specification" && specificationTextsEquivalent(candidate, text));
+  });
+  if (optionMatches.length > 1) {
+    throw Object.assign(new Error(`销售属性选项“${text}”不唯一`), { code: "pattern_property_option_ambiguous", key, text });
+  }
+  let created;
+  if (optionMatches.length === 1) {
+    created = clone(optionMatches[0]);
+  } else {
+    const maxLength = Number.isFinite(Number(meta.maxLength)) && Number(meta.maxLength) > 0 ? Math.floor(Number(meta.maxLength)) : 30;
+    if (text.length > maxLength) {
+      throw Object.assign(new Error(`销售属性“${text}”超过页面 ${maxLength} 字符限制`), { code: "pattern_property_text_too_long", key, text });
+    }
+    const maxItems = Number(meta.maxCustomItems);
+    if (Number.isFinite(maxItems) && maxItems >= 0 && values.length + 1 > maxItems) {
+      throw Object.assign(new Error(`销售属性 ${key} 超过页面允许的 ${maxItems} 个值`), { code: "pattern_custom_value_capacity", key });
+    }
+    const usedValueIds = new Set(Object.values(formValues.saleProp).flatMap((entries) => (Array.isArray(entries) ? entries.map((value) => String(value?.value ?? "")) : [])));
+    const measurement = meta.isMeasurement === true || meta.uiType === "newMeasurement";
+    if (measurement) {
+      const structItems = parseMeasurementStructItems(text, meta);
+      if (!structItems) {
+        throw Object.assign(new Error(`测量型销售属性“${text}”不符合页面要求的数字、分隔符或单位结构`), {
+          code: "pattern_measurement_value_invalid",
+          key,
+          text,
+        });
+      }
+      created = { value: patternCustomValueId(task, key, text, usedValueIds), text, structItems };
+    } else {
+      if (meta.hasCustomProp !== true && meta.isCustomSelectSaleProp !== true) {
+        throw Object.assign(new Error(`页面不允许新增销售属性“${text}”`), { code: "pattern_custom_value_unsupported", key, text });
+      }
+      created = { value: patternCustomValueId(task, key, text, usedValueIds), text };
+    }
+    const customValues = customValuesByKey.get(key) || [];
+    customValues.push(created);
+    customValuesByKey.set(key, customValues);
+  }
+  values.push(created);
+  return created;
+}
+
+function replacePatternProp(row, key, value) {
+  const props = Array.isArray(row.props) ? row.props : [];
+  const current = props.find((prop) => String(prop?.name) === String(key));
+  if (!current) throw Object.assign(new Error(`SKU 模板缺少销售属性 ${key}`), { code: "pattern_template_property_missing", key });
+  const replacement = { ...clone(current), ...clone(value), name: key, value: value.value, text: value.text };
+  for (const field of ["img", "pix"]) {
+    if (!Object.hasOwn(value, field)) delete replacement[field];
+  }
+  row.props = props.map((prop) => String(prop?.name) === String(key) ? replacement : prop);
+  const skuParamKey = `skuParam_${key}`;
+  const skuParam = row[skuParamKey];
+  const mirrorsProp = skuParam && typeof skuParam === "object"
+    && String(skuParam.value ?? "").replace(/^-/, "") === String(current.value ?? "").replace(/^-/, "");
+  if (mirrorsProp) {
+    const normalizedValue = String(value.value ?? "").replace(/^-/, "");
+    const nextSkuParam = {
+      ...clone(skuParam),
+      value: typeof skuParam.value === "number" ? Number(normalizedValue) : normalizedValue,
+      text: value.text,
+    };
+    if (Object.hasOwn(value, "structItems")) nextSkuParam.structItems = clone(value.structItems);
+    else delete nextSkuParam.structItems;
+    row[skuParamKey] = nextSkuParam;
+  }
+}
+
+function patternTemplateSignature(row, specificationKey, colorKey) {
+  return JSON.stringify(canonicalize(Object.fromEntries(skuParamEntries(row)
+    .filter(([key]) => key !== `skuParam_${specificationKey}` && key !== `skuParam_${colorKey}`))));
+}
+
+function selectPatternTemplate(originalRows, input, specificationKey, colorKey) {
+  const sameSpecification = originalRows.filter((row) => specificationTextsEquivalent(patternPropText(row, specificationKey), input.specification));
+  const sameColor = originalRows.filter((row) => patternPropText(row, colorKey) === input.color);
+  const candidates = sameSpecification.length ? sameSpecification : sameColor.length ? sameColor : originalRows;
+  const signatures = new Set(candidates.map((row) => patternTemplateSignature(row, specificationKey, colorKey)));
+  if (signatures.size > 1) {
+    throw Object.assign(new Error(`Excel 第 ${input.sourceRow} 行无法唯一继承 SKU 明细参数`), {
+      code: "pattern_template_ambiguous",
+      sourceRow: input.sourceRow,
+    });
+  }
+  return candidates[0];
+}
+
+function assertExistingPatternFields(row, input) {
+  const actualPrice = normalizePatternMoney(row?.skuPrice);
+  const actualOuterId = String(row?.skuOuterId ?? "").trim();
+  const actualBarcode = String(row?.skuBarcode ?? "").trim();
+  const mismatches = [];
+  if (actualPrice !== input.price) mismatches.push("价格");
+  if (actualOuterId !== input.merchantCode) mismatches.push("商家编码");
+  if (actualBarcode !== input.barcode) mismatches.push("条形码");
+  if (mismatches.length) {
+    throw Object.assign(new Error(`Excel 第 ${input.sourceRow} 行已存在组合的${mismatches.join("、")}与线上不一致`), {
+      code: "pattern_existing_field_mismatch",
+      sourceRow: input.sourceRow,
+      fields: mismatches,
+    });
+  }
+}
+
+export function buildAddPatternForm(formValues, rawSalePropMeta, task) {
+  const original = clone(formValues);
+  const originalRows = activeRows(original.sku);
+  if (!originalRows.length) throw Object.assign(new Error("商品没有可处理的 SKU"), { code: "sku_rows_missing" });
+  const requestedRows = normalizePatternRows(task);
+  const salePropMeta = Array.isArray(rawSalePropMeta) && rawSalePropMeta.every((meta) => meta?.key)
+    ? rawSalePropMeta
+    : normalizeSalePropMeta(rawSalePropMeta);
+  const propertyKeys = resolvePatternPropertyKeys(original, salePropMeta, requestedRows);
+  const metadata = new Map(salePropMeta.map((meta) => [String(meta.key), meta]));
+  const next = clone(original);
+  next.saleProp = clone(original.saleProp);
+  next.channelOption = normalizeChannelOption(original, task?.channelOption);
+  const customValuesByKey = new Map();
+  const existing = [];
+  const additions = [];
+  const existingOuterIds = new Set(originalRows.map((row) => String(row?.skuOuterId ?? "").trim()).filter(Boolean));
+  const existingBarcodes = new Set(originalRows.map((row) => String(row?.skuBarcode ?? "").trim()).filter(Boolean));
+
+  for (const input of requestedRows) {
+    const matches = originalRows.filter((row) => (
+      specificationTextsEquivalent(patternPropText(row, propertyKeys.specificationKey), input.specification)
+      && patternPropText(row, propertyKeys.colorKey) === input.color
+    ));
+    if (matches.length > 1) {
+      throw Object.assign(new Error(`Excel 第 ${input.sourceRow} 行在线上匹配到多个 SKU 明细`), { code: "pattern_existing_mapping_ambiguous", sourceRow: input.sourceRow });
+    }
+    if (matches.length === 1) {
+      assertExistingPatternFields(matches[0], input);
+      existing.push({ input, row: matches[0], skuId: positiveSkuId(matches[0].skuId) });
+      continue;
+    }
+    if (!input.merchantCode) {
+      throw Object.assign(new Error(`Excel 第 ${input.sourceRow} 行是待新增组合，商家编码不能为空`), { code: "pattern_new_outer_id_missing", sourceRow: input.sourceRow });
+    }
+    if (existingOuterIds.has(input.merchantCode)) {
+      throw Object.assign(new Error(`Excel 第 ${input.sourceRow} 行商家编码已被线上 SKU 使用`), { code: "pattern_outer_id_conflict", sourceRow: input.sourceRow });
+    }
+    if (input.barcode && existingBarcodes.has(input.barcode)) {
+      throw Object.assign(new Error(`Excel 第 ${input.sourceRow} 行条形码已被线上 SKU 使用`), { code: "pattern_barcode_conflict", sourceRow: input.sourceRow });
+    }
+    existingOuterIds.add(input.merchantCode);
+    if (input.barcode) existingBarcodes.add(input.barcode);
+
+    const specificationValue = ensurePatternValue(next, metadata, propertyKeys.specificationKey, input.specification, task, customValuesByKey, "specification");
+    const colorValue = ensurePatternValue(next, metadata, propertyKeys.colorKey, input.color, task, customValuesByKey, "color");
+    const template = selectPatternTemplate(originalRows, input, propertyKeys.specificationKey, propertyKeys.colorKey);
+    const row = clone(template);
+    const colorAlreadyExisted = Boolean(findPatternValue(original.saleProp[propertyKeys.colorKey], input.color, "pattern_property_text_ambiguous", "color"));
+    replacePatternProp(row, propertyKeys.specificationKey, specificationValue);
+    replacePatternProp(row, propertyKeys.colorKey, colorValue);
+    row.skuId = null;
+    row.skuOldSku = null;
+    row.sourceSkuId = null;
+    row.skuPrice = input.price;
+    row.skuStock = input.quantity;
+    row.skuOuterId = input.merchantCode;
+    row.skuBarcode = input.barcode;
+    row.disabled = false;
+    row.action = { ...(row.action || {}), selected: true };
+    if (!colorAlreadyExisted) {
+      delete row.skuPicture;
+      delete row.skuTitle;
+    }
+    row.salePropKey = canonicalSalePropKeyFromProps(row.props);
+    additions.push({ input, row });
+  }
+
+  next.sku = [...clone(originalRows), ...additions.map((entry) => clone(entry.row))];
+  const identities = next.sku.map(rowDetailIdentity);
+  if (identities.some((identity) => !identity) || new Set(identities).size !== identities.length) {
+    throw Object.assign(new Error("新增花型后的 SKU 组合不唯一"), { code: "pattern_combination_identity_invalid" });
+  }
+  return {
+    formValues: next,
+    propertyKeys,
+    existing,
+    additions,
+    customValues: [...customValuesByKey].map(([key, values]) => ({ key, meta: metadata.get(key), values })),
+  };
+}
+
+function expectedSubsetMismatch(expected, actual, path = "") {
+  if (Array.isArray(expected)) {
+    if (!Array.isArray(actual) || expected.length !== actual.length) {
+      return { path: path || "<root>", expected, actual };
+    }
+    for (let index = 0; index < expected.length; index += 1) {
+      const mismatch = expectedSubsetMismatch(expected[index], actual[index], `${path}[${index}]`);
+      if (mismatch) return mismatch;
+    }
+    return null;
+  }
+  if (expected && typeof expected === "object") {
+    if (!actual || typeof actual !== "object" || Array.isArray(actual)) {
+      return { path: path || "<root>", expected, actual };
+    }
+    for (const [key, value] of Object.entries(expected)) {
+      const nextPath = path ? `${path}.${key}` : key;
+      if (!Object.hasOwn(actual, key)) return { path: nextPath, expected: value, actual: undefined };
+      const mismatch = expectedSubsetMismatch(value, actual[key], nextPath);
+      if (mismatch) return mismatch;
+    }
+    return null;
+  }
+  return Object.is(expected, actual) ? null : { path: path || "<root>", expected, actual };
+}
+
+function compareRetainedSkuRows(expectedRows, actualRows) {
+  const expected = activeRows(expectedRows);
+  const actual = activeRows(actualRows);
+  if (expected.length !== actual.length) return { equal: false, reason: `原 SKU 数量 ${actual.length} != ${expected.length}` };
+  const actualById = new Map();
+  for (const row of actual) {
+    const skuId = positiveSkuId(row?.skuId);
+    if (!skuId || actualById.has(skuId)) return { equal: false, reason: "原 SKU ID 缺失或重复" };
+    actualById.set(skuId, row);
+  }
+  for (const row of expected) {
+    const skuId = positiveSkuId(row?.skuId);
+    const candidate = skuId ? actualById.get(skuId) : null;
+    if (!candidate) return { equal: false, reason: `原 SKU ${skuId || "未知"} 未完整保留` };
+    const expectedBusiness = businessSkuRow(row, { ignoreStock: true });
+    const actualBusiness = businessSkuRow(candidate, { ignoreStock: true });
+    const mismatch = expectedSubsetMismatch(expectedBusiness, actualBusiness);
+    if (mismatch) {
+      return {
+        equal: false,
+        reason: `原 SKU ${skuId} 的字段 ${mismatch.path} 与快照不一致`,
+        field: mismatch.path,
+      };
+    }
+  }
+  return { equal: true, reason: "原 SKU 受保护字段保持一致（库存采用平台实时值）", ignoredFields: ["skuStock", "平台预检新增字段"] };
+}
+
+function validateAddPatternPrewrite(original, candidate, plan) {
+  const originalRows = activeRows(original.sku);
+  const candidateRows = activeRows(candidate.sku);
+  if (candidateRows.length !== originalRows.length + plan.additions.length) {
+    throw prewriteStateError("pattern", "SKU 数量与新增计划不一致");
+  }
+  assertSameChannel(original, candidate, "pattern");
+  const originalIds = new Set(originalRows.map((row) => positiveSkuId(row?.skuId)));
+  const retainedRows = candidateRows.filter((row) => originalIds.has(positiveSkuId(row?.skuId)));
+  const retainedComparison = compareRetainedSkuRows(originalRows, retainedRows);
+  if (!retainedComparison.equal || retainedRows.length !== originalRows.length) {
+    throw prewriteStateError("pattern", retainedComparison.reason || "原 SKU 未完整保留");
+  }
+  const newRows = candidateRows.filter((row) => !positiveSkuId(row?.skuId));
+  if (newRows.length !== plan.additions.length || newRows.some((row) => row.skuOldSku !== null || row.sourceSkuId !== null)) {
+    throw prewriteStateError("pattern", "待新增 SKU 身份字段未清空");
+  }
+  const identities = candidateRows.map(rowDetailIdentity);
+  if (identities.some((identity) => !identity) || new Set(identities).size !== identities.length) {
+    throw prewriteStateError("pattern", "SKU 明细组合重复或无法识别");
+  }
+}
+
+function compareAddPatternResult(original, expected, plan, actual) {
+  try {
+    const originalRows = activeRows(original.sku);
+    const expectedRows = activeRows(expected.sku);
+    const actualRows = activeRows(actual.sku);
+    if (actualRows.length !== expectedRows.length) return { equal: false, reason: `SKU 数量 ${actualRows.length} != ${expectedRows.length}`, ignoredFields: ["skuStock"] };
+    if (!compareSaleProps(expected.saleProp, actual.saleProp)) return { equal: false, reason: "销售属性与新增计划不一致", ignoredFields: ["skuStock"] };
+    if (normalizeChannelOption(expected).value !== normalizeChannelOption(actual).value) return { equal: false, reason: "销售渠道与原快照不一致", ignoredFields: ["skuStock"] };
+    const fieldComparison = compareSkuRows(expectedRows, actualRows, { ignoreStock: true });
+    if (!fieldComparison.equal) return fieldComparison;
+
+    const actualByIdentity = new Map();
+    for (const row of actualRows) {
+      const identity = rowDetailIdentity(row);
+      if (!identity || actualByIdentity.has(identity)) return { equal: false, reason: "最终 SKU 组合缺失或重复", ignoredFields: ["skuStock"] };
+      actualByIdentity.set(identity, row);
+    }
+    const originalIds = new Set(originalRows.map((row) => positiveSkuId(row?.skuId)));
+    for (const row of originalRows) {
+      const actualRow = actualByIdentity.get(rowDetailIdentity(row));
+      if (!actualRow || positiveSkuId(actualRow.skuId) !== positiveSkuId(row.skuId)) {
+        return { equal: false, reason: "原 SKU ID 或组合发生变化", ignoredFields: ["skuStock"] };
+      }
+    }
+    const addedSkuIds = plan.additions.map(({ row }) => positiveSkuId(actualByIdentity.get(rowDetailIdentity(row))?.skuId));
+    if (addedSkuIds.some((skuId) => !skuId || originalIds.has(skuId)) || new Set(addedSkuIds).size !== addedSkuIds.length) {
+      return { equal: false, reason: "新增组合未得到唯一的新 SKU ID", ignoredFields: ["skuStock"] };
+    }
+    const allIds = actualRows.map((row) => positiveSkuId(row?.skuId));
+    if (allIds.some((skuId) => !skuId) || new Set(allIds).size !== actualRows.length) {
+      return { equal: false, reason: "最终 SKU ID 集合不完整或重复", ignoredFields: ["skuStock"] };
+    }
+    return {
+      equal: true,
+      reason: "原 SKU 已保留，新增组合和业务字段回读一致（库存采用平台实时值）",
+      ignoredFields: ["skuStock"],
+      existingSkuIds: [...originalIds],
+      addedSkuIds,
+    };
+  } catch (cause) {
+    return { equal: false, reason: cause?.message || "新增花型最终回读无法比较", ignoredFields: ["skuStock"] };
+  }
+}
+
 function globalField(global, name) {
   return global?.[name] ?? global?.value?.[name];
 }
@@ -1024,6 +1701,14 @@ async function submitThroughApi(page, formValues, global, baseUrl) {
   };
 }
 
+async function submitWithWriteLock(page, formValues, global, baseUrl, hooks, phase, itemId) {
+  const submit = () => submitThroughApi(page, formValues, global, baseUrl);
+  if (typeof hooks.withWriteLock === "function") {
+    return hooks.withWriteLock(submit, { phase, itemId: String(itemId) });
+  }
+  return submit();
+}
+
 export async function executeTmallRebuild(page, task, hooks = {}) {
   let writeAttempted = false;
   const hookErrors = [];
@@ -1040,29 +1725,31 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
       hookErrors.push(issue);
     }
   };
-  const reportPhase = (phase, message, level, progress) => invokeHook("onPhase", { phase, message, level, progress });
   const baseUrl = `https://sell.publish.tmall.com/tmall/publish.htm?id=${encodeURIComponent(task.itemId)}`;
+  const timingStartedAt = Date.now();
+  let timingBoundaryAt = timingStartedAt;
+  const reportPhase = (phase, message, level, progress) => {
+    const currentAt = Date.now();
+    const entry = {
+      phase,
+      message,
+      level,
+      progress,
+      durationMs: currentAt - timingBoundaryAt,
+      elapsedMs: currentAt - timingStartedAt,
+    };
+    timingBoundaryAt = currentAt;
+    return invokeHook("onPhase", entry);
+  };
   if (!page || page.isClosed()) throw Object.assign(new Error("专属 Edge 页面不可用"), { code: "browser_page_unavailable" });
   let state = await fetchInitialState(page, baseUrl);
   assertItemIdentity(state, baseUrl, task.itemId);
   const original = clone(state.formValues);
-  let inventoryMappings = activeRows(original.sku).map((row) => inventoryMappingFromRow(row, row));
-  if (typeof hooks.resolveInventory === "function") {
-    let resolution;
-    try {
-      resolution = await hooks.resolveInventory(activeRows(original.sku).map(clone), { itemId: String(task.itemId), requireBarcode: true });
-      inventoryMappings = applyInventoryResolution(original, resolution);
-    } catch (cause) {
-      throw Object.assign(new Error(cause?.message || "Doris SKU 资料解析失败"), { code: cause?.code || "inventory_resolution_failed", cause });
-    }
-    await invokeHook("onInventory", {
-      phase: "resolved",
-      mappings: inventoryMappings.map(({ materialNo, subMaterialName, specification }) => ({ materialNo, subMaterialName, specification })),
-    });
-  }
-  const channelOption = normalizeChannelOption(original);
+  const channelOption = resolveTaskChannelOption(state, task);
+  const observedChannelOption = inspectChannelOption(state.formValues);
   original.channelOption = channelOption;
   const originalSummary = summarizeForm(original);
+  originalSummary.channelOption = observedChannelOption.rawValue;
   originalSummary.detailVariant = clone(state.detailVariant || detectPublishVariant(original, state.salePropMeta));
   task.detailVariant = originalSummary.detailVariant;
   if (!originalSummary.skuCount) throw Object.assign(new Error("商品没有可处理的 SKU"), { code: "sku_rows_missing" });
@@ -1084,7 +1771,8 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
     sku: clone(original.sku),
     saleProp: clone(original.saleProp),
     oldsku: clone(original.oldsku || []),
-    channelOption: clone(original.channelOption),
+    channelOption: clone(state.formValues.channelOption),
+    plannedChannelOption: clone(channelOption),
   };
   recoverySnapshot.sha256 = canonicalHash(recoverySnapshot);
   await invokeHook("onRecoverySnapshot", recoverySnapshot);
@@ -1107,7 +1795,7 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   await reportPhase("temp_submitting", "已生成临时唯一规格，准备提交以获取新 SKU", "warning", 32);
   await invokeHook("onWriteStart", { phase: "temporary_submit" });
   writeAttempted = true;
-  const temporarySubmit = await submitThroughApi(page, temporary.formValues, state.global, baseUrl);
+  const temporarySubmit = await submitWithWriteLock(page, temporary.formValues, state.global, baseUrl, hooks, "temporary_submit", task.itemId);
   await invokeHook("onNetwork", { phase: "temporary_submit", path: PUBLISH_PATH, method: "POST", status: temporarySubmit.status, classification: temporarySubmit.classification });
   if (!temporarySubmit.classification.ok) throw Object.assign(new Error(temporarySubmit.classification.message), { code: temporarySubmit.classification.code, businessCode: temporarySubmit.classification.businessCode });
   const oldIds = new Set(originalSummary.oldSkuIds);
@@ -1139,7 +1827,7 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   validateFinalPrewrite(restore, restore, generatedIds);
   await reportPhase("restoring", "正在恢复原规格、价格、库存、商家编码和条码", "info", 72);
   await invokeHook("onWriteStart", { phase: "final_submit" });
-  const finalSubmit = await submitThroughApi(page, restore, state.global, baseUrl);
+  const finalSubmit = await submitWithWriteLock(page, restore, state.global, baseUrl, hooks, "final_submit", task.itemId);
   await invokeHook("onNetwork", { phase: "final_submit", path: PUBLISH_PATH, method: "POST", status: finalSubmit.status, classification: finalSubmit.classification });
   if (!finalSubmit.classification.ok) throw Object.assign(new Error(finalSubmit.classification.message), { code: finalSubmit.classification.code, businessCode: finalSubmit.classification.businessCode });
   const sortedGeneratedIds = [...generatedIds].sort();
@@ -1169,8 +1857,146 @@ export async function executeTmallRebuild(page, task, hooks = {}) {
   await reportPhase("final_verifying", "最终回读一致：原规格字段已恢复且 SKU ID 已更新（库存采用平台实时值）", "success", 100);
   const skuMappings = activeRows(original.sku).map((row, index) => ({
     oldSkuId: positiveSkuId(row?.skuId),
-    newSkuId: positiveSkuId(generatedIds[index]),
-    ...inventoryMappings[index],
+    newSkuId: positiveSkuId(restoreIds[index]),
   }));
   return { oldSkuIds: originalSummary.skuIds, newSkuIds: finalIds, skuCount: finalSummary.skuCount, detailVariant: originalSummary.detailVariant, comparison, skuMappings, hookErrors };
+}
+
+export async function executeTmallAddPattern(page, task, hooks = {}) {
+  let writeAttempted = false;
+  const hookErrors = [];
+  const invokeHook = async (name, payload) => {
+    const callback = hooks[name];
+    if (typeof callback !== "function") return;
+    try {
+      await callback(payload);
+    } catch (cause) {
+      const issue = { hook: name, phase: payload?.phase || "unknown", message: cause?.message || String(cause) };
+      if (!writeAttempted) {
+        throw Object.assign(new Error(`写入前状态持久化失败: ${issue.message}`), { code: "prewrite_hook_failed", hook: name, cause });
+      }
+      hookErrors.push(issue);
+    }
+  };
+  const baseUrl = `https://sell.publish.tmall.com/tmall/publish.htm?id=${encodeURIComponent(task.itemId)}`;
+  const timingStartedAt = Date.now();
+  let timingBoundaryAt = timingStartedAt;
+  const reportPhase = (phase, message, level, progress) => {
+    const currentAt = Date.now();
+    const entry = {
+      phase,
+      message,
+      level,
+      progress,
+      durationMs: currentAt - timingBoundaryAt,
+      elapsedMs: currentAt - timingStartedAt,
+    };
+    timingBoundaryAt = currentAt;
+    return invokeHook("onPhase", entry);
+  };
+
+  if (!page || page.isClosed()) throw Object.assign(new Error("专属 Edge 页面不可用"), { code: "browser_page_unavailable" });
+  let state = await fetchInitialState(page, baseUrl);
+  assertItemIdentity(state, baseUrl, task.itemId);
+  const original = clone(state.formValues);
+  const observedChannelOption = inspectChannelOption(state.formValues);
+  original.channelOption = resolveTaskChannelOption(state, task);
+  const originalSummary = summarizeForm(original);
+  originalSummary.channelOption = observedChannelOption.rawValue;
+  originalSummary.detailVariant = clone(state.detailVariant || detectPublishVariant(original, state.salePropMeta));
+  task.detailVariant = originalSummary.detailVariant;
+  assertExactUniqueSkuIds(originalSummary, originalSummary.skuCount, "sku_snapshot_id_invalid");
+  const recoverySnapshot = {
+    itemId: String(task.itemId),
+    operation: "add_pattern",
+    sku: clone(original.sku),
+    saleProp: clone(original.saleProp),
+    oldsku: clone(original.oldsku || []),
+    channelOption: clone(state.formValues.channelOption),
+    plannedChannelOption: clone(original.channelOption),
+  };
+  recoverySnapshot.sha256 = canonicalHash(recoverySnapshot);
+  await invokeHook("onRecoverySnapshot", recoverySnapshot);
+  await invokeHook("onSnapshot", { phase: "before", summary: originalSummary });
+  await reportPhase("reading_snapshot", `已读取商品快照：${originalSummary.skuCount} 个现有 SKU`, "info", 15);
+
+  const plan = buildAddPatternForm(original, state.salePropMeta, task);
+  await invokeHook("onPatternPlan", {
+    phase: "pattern_plan",
+    existingCount: plan.existing.length,
+    additionCount: plan.additions.length,
+    propertyKeys: plan.propertyKeys,
+  });
+  if (!plan.additions.length) {
+    const comparison = {
+      equal: true,
+      reason: "Excel 中的组合均已存在且业务字段一致，无需提交",
+      ignoredFields: ["skuStock"],
+      existingSkuIds: plan.existing.map((entry) => entry.skuId).filter(Boolean),
+      addedSkuIds: [],
+    };
+    await invokeHook("onSnapshot", { phase: "after", summary: originalSummary, comparison });
+    await reportPhase("pattern_verifying", `已核对 ${plan.existing.length} 个现有组合，无需新增`, "success", 100);
+    return {
+      oldSkuIds: originalSummary.skuIds,
+      newSkuIds: originalSummary.skuIds,
+      existingSkuIds: comparison.existingSkuIds,
+      addedSkuIds: [],
+      skuCount: originalSummary.skuCount,
+      existingCount: plan.existing.length,
+      additionCount: 0,
+      detailVariant: originalSummary.detailVariant,
+      comparison,
+      hookErrors,
+      writeAttempted: false,
+    };
+  }
+
+  await reportPhase("pattern_preparing", `已识别 ${plan.existing.length} 个现有组合，准备新增 ${plan.additions.length} 个组合`, "info", 38);
+  for (const custom of plan.customValues) {
+    const checks = await validateCustomSalePropValues(page, { meta: custom.meta }, custom.values, state.global, baseUrl);
+    for (const check of checks) await invokeHook("onNetwork", { phase: "sale_prop_custom_check", ...check });
+  }
+  const preview = await previewSalePropValues(page, plan.formValues, state.global);
+  plan.formValues.sku = mergePreviewRows(plan.formValues.sku, preview.rows, { preserveIdentities: true });
+  plan.formValues.channelOption = clone(original.channelOption);
+  validateAddPatternPrewrite(original, plan.formValues, plan);
+  const candidateState = { ...state, formValues: plan.formValues };
+  assertItemIdentity(candidateState, baseUrl, task.itemId);
+
+  await reportPhase("pattern_submitting", `销售属性预检通过，正在提交 ${plan.additions.length} 个新增组合`, "warning", 58);
+  await invokeHook("onWriteStart", { phase: "pattern_submit" });
+  writeAttempted = true;
+  const submit = await submitWithWriteLock(page, plan.formValues, state.global, baseUrl, hooks, "pattern_submit", task.itemId);
+  await invokeHook("onNetwork", { phase: "pattern_submit", path: PUBLISH_PATH, method: "POST", status: submit.status, classification: submit.classification });
+  if (!submit.classification.ok) {
+    throw Object.assign(new Error(submit.classification.message), { code: submit.classification.code, businessCode: submit.classification.businessCode });
+  }
+
+  await reportPhase("pattern_verifying", "新增花型提交成功，正在执行服务端最终回读", "info", 75);
+  state = await loadReadback(page, baseUrl, candidateState, "final_readback", (candidate) => (
+    compareAddPatternResult(original, plan.formValues, plan, candidate.formValues).equal
+  ), hooks.readbackTiming);
+  await invokeHook("onReadback", state.readback);
+  assertItemIdentity(state, baseUrl, task.itemId);
+  const comparison = compareAddPatternResult(original, plan.formValues, plan, state.formValues);
+  if (!comparison.equal) {
+    throw Object.assign(new Error(`新增花型最终回读不一致：${comparison.reason}`), { code: "pattern_final_mismatch", reason: comparison.reason });
+  }
+  const finalSummary = summarizeForm(state.formValues);
+  await invokeHook("onSnapshot", { phase: "after", summary: finalSummary, comparison });
+  await reportPhase("pattern_verifying", `最终回读一致：保留 ${originalSummary.skuCount} 个原 SKU，新增 ${comparison.addedSkuIds.length} 个 SKU`, "success", 100);
+  return {
+    oldSkuIds: originalSummary.skuIds,
+    newSkuIds: finalSummary.skuIds,
+    existingSkuIds: comparison.existingSkuIds,
+    addedSkuIds: comparison.addedSkuIds,
+    skuCount: finalSummary.skuCount,
+    existingCount: plan.existing.length,
+    additionCount: plan.additions.length,
+    detailVariant: originalSummary.detailVariant,
+    comparison,
+    hookErrors,
+    writeAttempted: true,
+  };
 }

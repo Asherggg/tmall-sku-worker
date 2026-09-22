@@ -1,5 +1,7 @@
 # OpenShip 商品资料查询服务部署方案
 
+> 归档说明：v0.1.25 纯 SKU ID 重建版不再打包或调用本服务。本文仅保留旧版本部署记录。
+
 ## 1. 目标
 
 把 Doris 商品资料查询能力部署成一个独立的 HTTPS 服务，由 OpenShip 负责构建、发布、域名、TLS 和进程维护。桌面版 Tmall SKU Worker 只调用这个服务，不直连 Doris，也不携带 Doris 账号密码。
