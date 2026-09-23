@@ -122,7 +122,7 @@ test("live health requires only the SKU rebuild contract", async () => {
   try {
     await waitForWorkerAt(isolatedPort);
     const missing = await (await fetch(`http://127.0.0.1:${isolatedPort}/health`)).json();
-    assert.equal(missing.workerVersion, "0.1.30");
+    assert.equal(missing.workerVersion, "0.1.31");
     assert.equal(missing.contract, "missing");
     assert.deepEqual(missing.workflow.missing, ["sku_rebuild", "add_pattern"]);
     assert.match(missing.message, /天猫商品写入契约未配置/);
@@ -489,6 +489,75 @@ test("new batch inputs cannot smuggle a channel selection", async () => {
   assert.equal(response.status, 400);
   assert.match((await response.json()).errors.join(" "), /销售渠道只能在任务读取旧值后人工选择/);
 });
+test("restart recovery converts orphaned queued and executing tasks without auto-resuming them", async () => {
+  const isolatedPort = await availablePort();
+  const isolatedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmall-worker-restart-recovery-test-"));
+  const createdAt = new Date().toISOString();
+  fs.writeFileSync(path.join(isolatedDataDir, "state.json"), `${JSON.stringify({
+    batches: [{ id: "orphan_batch", mode: "live", status: "running", taskIds: ["interrupted_task", "queued_task"], createdAt }],
+    tasks: [{
+      id: "interrupted_task",
+      batchId: "orphan_batch",
+      itemId: "828872681910",
+      skuIds: [],
+      mode: "live",
+      status: "pattern_verifying",
+      liveWriteStarted: true,
+      writePhase: "pattern",
+      attempts: 1,
+      progress: 75,
+      createdAt,
+      updatedAt: createdAt,
+      timeline: [],
+    }, {
+      id: "queued_task",
+      batchId: "orphan_batch",
+      itemId: "828872681911",
+      skuIds: [],
+      mode: "live",
+      status: "queued",
+      attempts: 1,
+      progress: 0,
+      createdAt,
+      updatedAt: createdAt,
+      timeline: [],
+    }],
+    audit: [],
+    browser: {},
+  }, null, 2)}\n`, "utf8");
+
+  let isolatedChild = spawnWorker(isolatedPort, isolatedDataDir, { TMALL_LIVE_ENABLED: "true", TMALL_LIVE_CONTRACT: "tmall-publish-v2" });
+  try {
+    await waitForWorkerAt(isolatedPort);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const interrupted = await (await fetch(`http://127.0.0.1:${isolatedPort}/tasks/interrupted_task`)).json();
+    const queued = await (await fetch(`http://127.0.0.1:${isolatedPort}/tasks/queued_task`)).json();
+    assert.equal(interrupted.status, "needs_manual_review");
+    assert.equal(interrupted.errorCode, "manual_recovery_required");
+    assert.equal(interrupted.liveWriteStarted, true);
+    assert.equal(queued.status, "needs_manual_review");
+    assert.equal(queued.errorCode, "worker_restart_recovery_required");
+    assert.equal((await (await fetch(`http://127.0.0.1:${isolatedPort}/batches`)).json()).batches[0].status, "failed");
+    assert.equal((await (await fetch(`http://127.0.0.1:${isolatedPort}/health`)).json()).unresolvedLiveWrites, 1);
+    const audit = await (await fetch(`http://127.0.0.1:${isolatedPort}/audit/export`)).json();
+    assert.equal(audit.records.filter((entry) => entry.phase === "restart_recovery").length, 2);
+
+    const blockedDeletion = await fetch(`http://127.0.0.1:${isolatedPort}/tasks/interrupted_task`, { method: "DELETE" });
+    assert.equal(blockedDeletion.status, 409);
+    const confirmedDeletion = await fetch(`http://127.0.0.1:${isolatedPort}/tasks/interrupted_task`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ confirmation: "确认已人工核对" }),
+    });
+    assert.equal(confirmedDeletion.status, 200);
+    assert.equal((await confirmedDeletion.json()).manuallyResolved, true);
+    assert.equal((await (await fetch(`http://127.0.0.1:${isolatedPort}/health`)).json()).unresolvedLiveWrites, 0);
+  } finally {
+    await stopWorker(isolatedChild);
+    fs.rmSync(isolatedDataDir, { recursive: true, force: true });
+  }
+});
+
 test("an unresolved live write survives restart and locks the item", async () => {
   const isolatedPort = await availablePort();
   const isolatedDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "tmall-worker-lock-test-"));

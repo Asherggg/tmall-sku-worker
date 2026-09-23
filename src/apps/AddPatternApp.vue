@@ -37,7 +37,7 @@ const props = withDefaults(defineProps<{ initialView?: View; launchToken?: numbe
   launchToken: 0,
 });
 
-const EXPECTED_WORKER_VERSION = "0.1.30";
+const EXPECTED_WORKER_VERSION = "0.1.31";
 const LIVE_CONFIRMATION = "确认线上新增花型";
 const MAX_VISIBLE_ROWS = 80;
 const ACTIVE_STATUSES: TaskStatus[] = ["queued", "reading_snapshot", "pattern_preparing", "pattern_submitting", "pattern_verifying"];

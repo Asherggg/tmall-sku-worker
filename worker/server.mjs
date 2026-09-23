@@ -17,7 +17,7 @@ const ADD_PATTERN_CONFIRMATION = "确认线上新增花型";
 const MANUAL_REVIEW_CONFIRMATION = "确认已人工核对";
 const VALID_CHANNEL_OPTIONS = new Set(["1", "2"]);
 const CHANNEL_OPTION_LABELS = Object.freeze({ "1": "纯电商", "2": "商场同款" });
-const VERSION = "0.1.30";
+const VERSION = "0.1.31";
 const LIVE_BATCH_CONCURRENCY = Math.min(2, Math.max(1, Number.parseInt(process.env.TMALL_LIVE_CONCURRENCY || "2", 10) || 2));
 const DEFAULT_LOGIN_URL = "https://myseller.taobao.com/home.htm/QnworkbenchHome/";
 const BROWSER_CDP_PORT = Number(process.env.TMALL_BROWSER_CDP_PORT || PORT + 1);
@@ -130,6 +130,7 @@ function addAudit(task, phase, details = {}) {
 }
 
 function addTimeline(task, phase, message, level = "info") {
+  if (!Array.isArray(task.timeline)) task.timeline = [];
   task.timeline.push({ at: now(), phase, message, level });
   task.updatedAt = now();
   task.phaseLabel = message;
@@ -1044,6 +1045,40 @@ async function route(request, response) {
     return json(response, Number(error.status) || 500, { error: code, message: error.message }, rid);
   }
 }
+
+function recoverInterruptedTasks() {
+  const recoverableStatuses = new Set(["queued", ...ACTIVE_TASK_STATUSES]);
+  const recovered = [];
+  for (const task of state.tasks) {
+    if (!recoverableStatuses.has(task.status)) continue;
+    const writeStarted = externalWriteStarted(task);
+    task.status = "needs_manual_review";
+    task.errorCode = writeStarted ? "manual_recovery_required" : "worker_restart_recovery_required";
+    task.errorMessage = writeStarted
+      ? "Worker 在天猫写入后重启，任务未完成最终确认；不会自动重试，请先核对服务端状态"
+      : "Worker 重启时任务尚未完成；未自动恢复执行，请人工确认后重试或删除";
+    addTimeline(task, "needs_manual_review", task.errorMessage, "warning");
+    addAudit(task, "restart_recovery", {
+      method: "LOCAL",
+      path: "worker://restart-recovery",
+      businessCode: task.errorCode,
+    });
+    recovered.push({ task, writeStarted });
+  }
+  if (!recovered.length) return;
+  for (const batch of state.batches) {
+    if (!recovered.some(({ task }) => task.batchId === batch.id)) continue;
+    const batchTasks = state.tasks.filter((task) => task.batchId === batch.id);
+    const statuses = batchTasks.map((task) => task.status);
+    if (statuses.length && statuses.every((status) => status === "succeeded")) batch.status = "succeeded";
+    else if (statuses.some((status) => status === "succeeded")) batch.status = "partial";
+    else if (statuses.some((status) => ["planned", "queued", "paused"].includes(status))) batch.status = "queued";
+    else batch.status = "failed";
+  }
+  saveState();
+}
+
+recoverInterruptedTasks();
 
 const server = http.createServer(route);
 server.listen(PORT, HOST, () => console.log(JSON.stringify({ ready: true, url: `http://${HOST}:${PORT}`, dataDir: DATA_DIR, mode: health().mode })));

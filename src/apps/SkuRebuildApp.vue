@@ -46,7 +46,7 @@ const emit = defineEmits<{
   status: [payload: { health: WorkerHealth; runningCount: number; reviewCount: number; totalCount: number }];
 }>();
 
-const EXPECTED_WORKER_VERSION = "0.1.30";
+const EXPECTED_WORKER_VERSION = "0.1.31";
 const LIVE_CONFIRMATION = "确认线上重建";
 const PREVIEW_ITEM_LIMIT = 10;
 
